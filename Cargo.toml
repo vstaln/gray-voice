@@ -1,0 +1,15 @@
+[package]
+name = "gray-voice"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Local TTS/STT voice tools for the gray agent harness"
+license = "MIT"
+[lib]
+name = "voice_plugin"
+path = "src/lib.rs"
+[[bin]]
+name = "voice"
+path = "src/main.rs"
+[dependencies]
+serde_json = { version = "1", features = ["preserve_order"] }
