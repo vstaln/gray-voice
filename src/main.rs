@@ -332,7 +332,7 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("manifest") => println!("{}", manifest()),
         Some("sidecar") => { let _ = sidecar(); }
-        Some("status") | Some("off") => println!("{}", status(&Shared {
+        Some("status") | Some("off") | Some("-h") | Some("--help") | Some("help") => println!("{}", status(&Shared {
             enabled: AtomicBool::new(false), pump_q: Mutex::new(VecDeque::new()),
             cv: Condvar::new(), heard: Mutex::new(VecDeque::new()),
             inflight: Mutex::new(HashMap::new()), denied: AtomicBool::new(false),
