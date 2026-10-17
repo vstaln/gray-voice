@@ -189,18 +189,24 @@ fn voice_listen(a: &Value) -> Result<String, String> {
     let secs = a["seconds"].as_u64().unwrap_or(5).clamp(1, 60).to_string();
     let whisper = pick(&["whisper-cli", "whisper", "main", "whisper-cpp"])
         .ok_or("no whisper.cpp binary (whisper-cli/main) found")?;
+    if !have("arecord") && !have("sox") {
+        return Err("no recorder — install alsa-utils (arecord) or sox".into());
+    }
     let wav = std::env::temp_dir()
         .join(format!("voice-{}.wav", std::process::id()));
     if !record(&wav, &secs) {
-        return Err("no recorder — install alsa-utils (arecord) or sox".into());
+        return Err("recording failed — no working mic device? (arecord/sox exited nonzero)".into());
     }
     let model = a["model"].as_str().map(str::to_string)
         .or_else(|| std::env::var("VOICE_MODEL").ok())
         .or_else(|| std::env::var("WHISPER_MODEL").ok());
-    let t = transcribe(&whisper, &wav, model.as_deref())
-        .ok_or_else(|| "whisper produced no text".to_string());
+    let t = transcribe(&whisper, &wav, model.as_deref());
     let _ = std::fs::remove_file(&wav);
-    t
+    match (t, &model) {
+        (Some(t), _) => Ok(t),
+        (None, None) => Err("whisper produced no text (no model configured — set VOICE_MODEL or pass `model`)".into()),
+        (None, Some(_)) => Err("whisper produced no text".into()),
+    }
 }
 
 fn tool(name: &str, args: &Value) -> Value {
