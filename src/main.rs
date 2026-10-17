@@ -221,6 +221,32 @@ fn tool(name: &str, args: &Value) -> Value {
     }
 }
 
+fn config_path() -> std::path::PathBuf {
+    let home = std::env::var_os("GRAY_HOME").map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".gray")))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    home.join("voice").join("config.json")
+}
+fn read_config() -> Value {
+    std::fs::read_to_string(config_path()).ok()
+        .and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_else(|| json!({}))
+}
+fn persist_enabled(on: bool) {
+    let mut c = read_config();
+    c["listen"] = json!(on);
+    if let Some(p) = config_path().parent() { let _ = std::fs::create_dir_all(p); }
+    let _ = std::fs::write(config_path(), serde_json::to_string_pretty(&c).unwrap_or_default());
+}
+
+fn missing_listen_deps() -> Vec<&'static str> {
+    let mut m = Vec::new();
+    if pick(&["whisper-cli", "whisper", "main", "whisper-cpp"]).is_none() {
+        m.push("whisper.cpp binary (whisper-cli/main)");
+    }
+    if !have("arecord") && !have("sox") { m.push("recorder (arecord/sox)"); }
+    m
+}
+
 fn status(sh: &Shared) -> String {
     let tts = pick(&["say","espeak-ng","espeak","piper","spd-say"]).unwrap_or("none".into());
     let stt = pick(&["whisper-cli","whisper","main","whisper-cpp"]).unwrap_or("none".into());
@@ -240,14 +266,24 @@ fn command_run(sh: &Arc<Shared>, params: &Value) -> Value {
         .and_then(|a| a.first()).and_then(Value::as_str).unwrap_or("status");
     let text = match verb {
         "on" => {
-            sh.enabled.store(true, Ordering::Relaxed);
-            if !sh.listener_started.swap(true, Ordering::Relaxed) {
-                let sh2 = Arc::clone(sh);
-                std::thread::spawn(move || listener(sh2));
+            let missing = missing_listen_deps();
+            if !missing.is_empty() {
+                format!("cannot listen — missing: {}", missing.join(", "))
+            } else {
+                sh.enabled.store(true, Ordering::Relaxed);
+                persist_enabled(true);
+                if !sh.listener_started.swap(true, Ordering::Relaxed) {
+                    let sh2 = Arc::clone(sh);
+                    std::thread::spawn(move || listener(sh2));
+                }
+                "listening on".to_string()
             }
-            "listening on".to_string()
         }
-        "off" => { sh.enabled.store(false, Ordering::Relaxed); "listening off".into() }
+        "off" => {
+            sh.enabled.store(false, Ordering::Relaxed);
+            persist_enabled(false);
+            "listening off".into()
+        }
         "status" => status(sh),
         other => format!("voice: on|off|status (got {other})"),
     };
@@ -259,7 +295,8 @@ fn command_run(sh: &Arc<Shared>, params: &Value) -> Value {
 fn sidecar() -> std::io::Result<()> {
     let sh = Arc::new(Shared {
         enabled: AtomicBool::new(std::env::var("VOICE_LISTEN")
-            .map(|v| v != "0" && !v.is_empty()).unwrap_or(false)),
+            .map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
+            || read_config()["listen"].as_bool().unwrap_or(false)),
         pump_q: Mutex::new(VecDeque::new()), cv: Condvar::new(),
         heard: Mutex::new(VecDeque::new()),
         inflight: Mutex::new(HashMap::new()),
@@ -338,11 +375,27 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("manifest") => println!("{}", manifest()),
         Some("sidecar") => { let _ = sidecar(); }
-        Some("status") | Some("off") | Some("-h") | Some("--help") | Some("help") => println!("{}", status(&Shared {
-            enabled: AtomicBool::new(false), pump_q: Mutex::new(VecDeque::new()),
-            cv: Condvar::new(), heard: Mutex::new(VecDeque::new()),
+        Some("status") => println!("{}", status(&Shared {
+            enabled: AtomicBool::new(read_config()["listen"].as_bool().unwrap_or(false)),
+            pump_q: Mutex::new(VecDeque::new()), cv: Condvar::new(),
+            heard: Mutex::new(VecDeque::new()),
             inflight: Mutex::new(HashMap::new()), denied: AtomicBool::new(false),
             seq: AtomicU64::new(0), listener_started: AtomicBool::new(false) })),
+        Some("on") => {
+            let missing = missing_listen_deps();
+            if !missing.is_empty() {
+                eprintln!("cannot listen — missing: {}", missing.join(", "));
+                std::process::exit(1);
+            }
+            persist_enabled(true);
+            println!("listening on (persisted — ambient mode starts when the sidecar loads; /voice on for the live session)");
+        }
+        Some("off") => {
+            persist_enabled(false);
+            println!("listening off (persisted)");
+        }
+        Some("-h") | Some("--help") | Some("help") =>
+            println!("voice — local TTS/STT.\n  voice status|on|off\n  in gray: /voice on|off|status\n  tools: voice_say voice_listen"),
         _ => {
             if args.is_empty() {
                 if std::io::stdin().is_terminal() {
