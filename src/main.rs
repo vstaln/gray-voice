@@ -39,6 +39,9 @@ fn manifest() -> Value {
              }},
         ],
         "commands": ["/voice"], "subcommands": ["voice"],
+        "composer_actions": [
+            {"keys": ["ctrl+space", "f8"], "argv": ["dictate", "6"], "busy": "listening, then transcribing"},
+        ],
     })
 }
 
@@ -405,21 +408,34 @@ fn stt_json() -> String {
     json!({"providers": rows}).to_string()
 }
 
+fn key_state(p: &Stt) -> &'static str {
+    match p.key {
+        Some(_) if provider_key(p).is_some() => "key set",
+        Some(_) => "no key",
+        None if p.id == "cloudflare" => "cf cli",
+        None => "no key needed",
+    }
+}
+
+fn stt_picker(selected: Option<&str>) -> Value {
+    let items: Vec<Value> = STT
+        .iter()
+        .map(|p| {
+            json!({
+                "id": p.id,
+                "label": format!("{} {}", if stt_enabled(p) { "on " } else { "off" }, p.label),
+                "description": format!("{} · {}", key_state(p), p.free),
+            })
+        })
+        .collect();
+    json!({"title": "voice · speech to text (Enter toggles)", "items": items, "selected_id": selected})
+}
+
 fn stt_panel() -> String {
     let mut out = String::from("voice · speech to text\n");
     for p in STT {
         let on = stt_enabled(p);
-        let key = match p.key {
-            Some(_) => {
-                if provider_key(p).is_some() {
-                    "key set"
-                } else {
-                    "no key"
-                }
-            }
-            None if p.id == "cloudflare" => "cf cli",
-            None => "no key needed",
-        };
+        let key = key_state(p);
         out.push_str(&format!(
             "  {} {:<10} {:<30} {:<12} {}\n",
             if on { "on " } else { "off" },
@@ -646,11 +662,24 @@ fn status(sh: &Shared) -> String {
 }
 
 fn command_run(sh: &Arc<Shared>, params: &Value) -> Value {
-    let verb = params["argv"]
+    let argv: Vec<&str> = params["argv"]
         .as_array()
-        .and_then(|a| a.first())
-        .and_then(Value::as_str)
-        .unwrap_or("status");
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    match argv.as_slice() {
+        [] => return json!({"result": {"picker": stt_picker(None)}}),
+        ["--pick", id] => {
+            let Some(p) = STT.iter().find(|p| p.id == *id) else {
+                return json!({"result": {"text": format!("unknown provider {id}")}});
+            };
+            if let Err(e) = stt_toggle(p, !stt_enabled(p)) {
+                return json!({"result": {"text": format!("{id}: config not saved: {e}")}});
+            }
+            return json!({"result": {"picker": stt_picker(Some(id))}});
+        }
+        _ => {}
+    }
+    let verb = argv[0];
     let text = match verb {
         "on" => {
             let missing = missing_listen_deps();
