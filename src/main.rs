@@ -7,7 +7,7 @@
 //! `host.turn`), with `prompt/context` as the pull fallback. Everything
 //! is binary-detected; absent pieces fail with install hints.
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, IsTerminal, Write};
 use std::process::{Command, Stdio};
@@ -24,14 +24,14 @@ fn manifest() -> Value {
         "capabilities": ["host.turn"],
         "hooks": ["prompt/context"],
         "tools": [
-            {"name": "voice_say",
+            {"name": "voice_say", "label": "Said", "preview": "{text|firstline}",
              "description": "Speak text aloud via the first available local TTS (say/espeak-ng/espeak/piper/spd-say).",
              "parameters": {"type": "object", "properties": {
                 "text": {"type": "string"},
                 "engine": {"type": "string", "description": "pin an engine: say|espeak-ng|espeak|piper|spd-say"},
                 "rate": {"type": "integer", "description": "words per minute where supported"}},
              "required": ["text"]}},
-            {"name": "voice_listen",
+            {"name": "voice_listen", "label": "Listened", "preview": "{seconds}s",
              "description": "Record N seconds from the mic and transcribe with the first working STT provider (whisper.cpp, groq, xai, cf). Needs a recorder (pw-record|arecord|sox). Ambient mode: /voice on|off.",
              "parameters": {"type": "object", "properties": {
                 "seconds": {"type": "integer"},
@@ -40,7 +40,7 @@ fn manifest() -> Value {
         ],
         "commands": ["/voice"], "subcommands": ["voice"],
         "composer_actions": [
-            {"id": "dictate", "keys": DEFAULT_HOTKEYS, "argv": ["dictate"], "busy": "listening"},
+            {"id": "dictate", "keys": [DEFAULT_HOTKEY], "argv": ["dictate"], "busy": "Rec 0:00"},
         ],
     })
 }
@@ -125,7 +125,7 @@ fn record(out: &std::path::Path, secs: &str) -> bool {
 /// Record until gray reports the hotkey pressed again (or released, in
 /// hold mode) on stdin as `down`/`up` lines, showing a level meter on
 /// stderr, which gray displays as the status line.
-fn record_live(out: &std::path::Path, hold: bool, key: &str) -> bool {
+fn record_live(out: &std::path::Path, hold: bool, key: &str) -> Result<usize, String> {
     use std::io::BufRead;
     use std::time::{Duration, Instant};
     let mut cmd = if have("pw-record") {
@@ -148,7 +148,7 @@ fn record_live(out: &std::path::Path, hold: bool, key: &str) -> bool {
         .stderr(std::process::Stdio::null())
         .spawn()
     else {
-        return false;
+        return Err("recording failed".into());
     };
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -158,14 +158,50 @@ fn record_live(out: &std::path::Path, hold: bool, key: &str) -> bool {
             }
         }
     });
+    let key = key.to_lowercase();
     let hint = if hold {
         format!("release {key} to stop")
     } else {
-        format!("press {key} to stop")
+        format!("{key} stop")
     };
+    let gate = voice_gate();
+    let (seg_tx, seg_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let worker = std::thread::spawn(move || {
+        let mut sent = 0usize;
+        let mut last_err = String::from("too quiet");
+        for (n, pcm) in seg_rx.into_iter().enumerate() {
+            let wav =
+                std::env::temp_dir().join(format!("voice-seg-{}-{n}.wav", std::process::id()));
+            if std::fs::write(&wav, wav_bytes(&pcm)).is_err() {
+                continue;
+            }
+            let t = if loud(&wav) {
+                stt_transcribe(&wav)
+            } else {
+                Err("too quiet".into())
+            };
+            let _ = std::fs::remove_file(&wav);
+            match t {
+                Ok(t) => {
+                    let sep = if sent == 0 { "" } else { " " };
+                    eprintln!("insert\t{sep}{}", t.replace(['\n', '\t'], " "));
+                    sent += 1;
+                }
+                Err(e) => last_err = e,
+            }
+        }
+        if sent == 0 {
+            Err(last_err)
+        } else {
+            Ok(sent)
+        }
+    });
     let start = Instant::now();
     let mut last_down = start;
     let mut levels: VecDeque<usize> = VecDeque::new();
+    let mut seg_start: Option<u64> = None;
+    let mut voiced = false;
+    let mut quiet_ticks = 0u32;
     loop {
         std::thread::sleep(Duration::from_millis(100));
         let mut stop = false;
@@ -175,8 +211,6 @@ fn record_live(out: &std::path::Path, hold: bool, key: &str) -> bool {
                 stop |= hold;
                 continue;
             }
-            // In press mode a new press stops; key auto-repeat from the
-            // opening press (or a held key) arrives early or in a tight stream.
             if !hold
                 && now - start > Duration::from_millis(700)
                 && now - last_down > Duration::from_millis(150)
@@ -185,15 +219,30 @@ fn record_live(out: &std::path::Path, hold: bool, key: &str) -> bool {
             }
             last_down = now;
         }
-        // Terminals that never report key release still auto-repeat a held
-        // key, so a pause in repeats means it was let go.
         if hold && last_down.elapsed() > Duration::from_millis(800) {
             stop = true;
         }
-        if start.elapsed() > Duration::from_secs(120) || !matches!(rec.try_wait(), Ok(None)) {
+        if start.elapsed() > Duration::from_secs(600) || !matches!(rec.try_wait(), Ok(None)) {
             stop = true;
         }
-        levels.push_back(level_now(out));
+        let (len, mean) = tail_mean(out);
+        let data_at = seg_start.get_or_insert_with(|| wav_data_offset(out).unwrap_or(44));
+        if mean > gate {
+            voiced = true;
+            quiet_ticks = 0;
+        } else {
+            quiet_ticks += 1;
+        }
+        let seg_len = len.saturating_sub(*data_at) & !1;
+        let paused = voiced && quiet_ticks >= 7 && seg_len >= 32_000;
+        if paused || seg_len >= 32_000 * 25 {
+            if let Some(pcm) = read_range(out, *data_at, seg_len) {
+                let _ = seg_tx.send(pcm);
+            }
+            *data_at += seg_len;
+            voiced = false;
+        }
+        levels.push_back(level_of(mean));
         if levels.len() > 16 {
             levels.pop_front();
         }
@@ -206,9 +255,11 @@ fn record_live(out: &std::path::Path, hold: bool, key: &str) -> bool {
                 ][i]
             })
             .collect();
+        let secs = start.elapsed().as_secs();
         eprintln!(
-            "listening {meter:\u{2581}<16} {}s  {hint}",
-            start.elapsed().as_secs()
+            "Rec {}:{:02}  {meter:\u{2581}<16}\t{hint}",
+            secs / 60,
+            secs % 60
         );
         if stop {
             break;
@@ -218,23 +269,83 @@ fn record_live(out: &std::path::Path, hold: bool, key: &str) -> bool {
         .args(["-INT", &rec.id().to_string()])
         .status();
     let _ = rec.wait();
-    eprintln!("transcribing");
-    std::fs::metadata(out).is_ok_and(|m| m.len() > 44)
+    let data_at = seg_start.unwrap_or_else(|| wav_data_offset(out).unwrap_or(44));
+    let len = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
+    let seg_len = len.saturating_sub(data_at) & !1;
+    if let Some(pcm) = read_range(out, data_at, seg_len).filter(|p| p.len() >= 3_200) {
+        let _ = seg_tx.send(pcm);
+    }
+    drop(seg_tx);
+    eprintln!("Transcribing\u{2026}");
+    worker
+        .join()
+        .unwrap_or_else(|_| Err("transcriber crashed".into()))
 }
 
-/// Level of the last 0.1 s written to the WAV, 0..=7 on a log scale.
-fn level_now(path: &std::path::Path) -> usize {
+fn voice_gate() -> f64 {
+    std::env::var("VOICE_RMS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(150.0)
+}
+
+fn wav_data_offset(path: &std::path::Path) -> Option<u64> {
+    use std::io::Read;
+    let mut head = vec![0u8; 512];
+    let n = std::fs::File::open(path).ok()?.read(&mut head).ok()?;
+    head[..n]
+        .windows(4)
+        .position(|w| w == b"data")
+        .map(|p| p as u64 + 8)
+}
+
+fn read_range(path: &std::path::Path, from: u64, len: u64) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    if len == 0 {
+        return None;
+    }
+    let mut f = std::fs::File::open(path).ok()?;
+    f.seek(SeekFrom::Start(from)).ok()?;
+    let mut buf = vec![0u8; len as usize];
+    f.read_exact(&mut buf).ok()?;
+    Some(buf)
+}
+
+fn wav_bytes(pcm: &[u8]) -> Vec<u8> {
+    let n = pcm.len() as u32;
+    let mut w = Vec::with_capacity(44 + pcm.len());
+    w.extend_from_slice(b"RIFF");
+    w.extend_from_slice(&(36 + n).to_le_bytes());
+    w.extend_from_slice(b"WAVEfmt ");
+    w.extend_from_slice(&16u32.to_le_bytes());
+    w.extend_from_slice(&1u16.to_le_bytes());
+    w.extend_from_slice(&1u16.to_le_bytes());
+    w.extend_from_slice(&16_000u32.to_le_bytes());
+    w.extend_from_slice(&32_000u32.to_le_bytes());
+    w.extend_from_slice(&2u16.to_le_bytes());
+    w.extend_from_slice(&16u16.to_le_bytes());
+    w.extend_from_slice(b"data");
+    w.extend_from_slice(&n.to_le_bytes());
+    w.extend_from_slice(pcm);
+    w
+}
+
+fn level_of(mean: f64) -> usize {
+    (((mean.max(1.0).ln() - 5.0) / 3.5 * 7.0).clamp(0.0, 7.0)) as usize
+}
+
+fn tail_mean(path: &std::path::Path) -> (u64, f64) {
     use std::io::{Read, Seek, SeekFrom};
     let Ok(mut f) = std::fs::File::open(path) else {
-        return 0;
+        return (0, 0.0);
     };
     let len = f.metadata().map(|m| m.len()).unwrap_or(0);
     if len < 44 + 3200 {
-        return 0;
+        return (len, 0.0);
     }
     let mut buf = vec![0u8; 3200];
     if f.seek(SeekFrom::Start((len - 3200) & !1)).is_err() || f.read_exact(&mut buf).is_err() {
-        return 0;
+        return (len, 0.0);
     }
     let mean = buf
         .as_chunks::<2>()
@@ -243,16 +354,13 @@ fn level_now(path: &std::path::Path) -> usize {
         .map(|b| f64::from(i16::from_le_bytes([b[0], b[1]])).abs())
         .sum::<f64>()
         / 1600.0;
-    (((mean.max(1.0).ln() - 5.0) / 3.5 * 7.0).clamp(0.0, 7.0)) as usize
+    (len, mean)
 }
 
 /// Mean |i16| over WAV data; below VOICE_RMS (default 150) the chunk is
 /// room noise and whisper never runs.
 fn loud(path: &std::path::Path) -> bool {
-    let gate: f64 = std::env::var("VOICE_RMS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(150.0);
+    let gate = voice_gate();
     let Ok(bytes) = std::fs::read(path) else {
         return false;
     };
@@ -649,29 +757,25 @@ fn hold_to_talk() -> bool {
 }
 
 fn voice_picker(selected: Option<&str>) -> Value {
-    let keys = hotkeys()
-        .iter()
-        .map(|k| key_label(k))
-        .collect::<Vec<_>>()
-        .join(" or ");
-    let key = key_label(&hotkeys()[0]);
+    let key = key_label(&hotkey());
     let mode = if hold_to_talk() {
         format!("Hold {key} while you talk")
     } else {
         format!("Press {key} to start and stop")
     };
     let mut items = vec![
-        json!({"id": "dictate", "label": "Dictate now", "description": format!("or press {keys} at the prompt")}),
-        json!({"id": "hotkey", "label": "Hotkey", "description": format!("{keys} \u{b7} Enter, then press a new key"),
+        json!({"id": "dictate", "label": "Dictate now", "description": format!("or press {key} at the prompt")}),
+        json!({"id": "hotkey", "label": "Hotkey", "description": format!("{key} \u{b7} Enter, then press a new key"),
                "capture_key": "Press the new dictation key"}),
         json!({"id": "mode", "label": "Mode", "description": format!("{mode} \u{b7} Enter to switch")}),
     ];
     let providers = stt_providers();
-    let off = providers.iter().filter(|p| !stt_enabled(p)).count();
-    for p in providers.iter().filter(|p| stt_enabled(p)) {
-        items.push(json!({"id": p.id, "label": format!("\u{25cf} {}", p.name), "description": format!("{} \u{b7} {}", key_state(p), p.free)}));
+    for (i, p) in providers.iter().filter(|p| stt_enabled(p)).enumerate() {
+        items.push(
+            json!({"id": p.id, "label": format!("\u{25cf} {}", p.name), "gap_before": i == 0}),
+        );
     }
-    items.push(json!({"id": "more", "label": "More providers", "description": format!("{off} off \u{b7} add your own")}));
+    items.push(json!({"id": "more", "label": "More providers", "gap_before": true}));
     json!({"title": "Voice", "items": items, "selected_id": selected})
 }
 
@@ -921,29 +1025,22 @@ fn config_path() -> std::path::PathBuf {
     gray_home().join("voice").join("config.json")
 }
 
-const DEFAULT_HOTKEYS: [&str; 2] = ["ctrl+space", "f8"];
+const DEFAULT_HOTKEY: &str = "ctrl+space";
 /// gray's keymap entry for the dictation action (see gray keybindings.json).
 const HOTKEY_ID: &str = "plugin.voice.dictate";
 
 /// The dictation keys: the user's keybindings.json entry, else the defaults.
-fn hotkeys() -> Vec<String> {
+fn hotkey() -> String {
     let user = std::fs::read_to_string(gray_home().join("keybindings.json"))
         .ok()
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
         .and_then(|v| v.get(HOTKEY_ID).cloned());
-    let keys: Vec<String> = match user {
-        Some(Value::String(k)) => vec![k],
-        Some(Value::Array(a)) => a
-            .iter()
-            .filter_map(|k| k.as_str().map(str::to_string))
-            .collect(),
-        _ => Vec::new(),
+    let first = match user {
+        Some(Value::String(k)) => Some(k),
+        Some(Value::Array(a)) => a.first().and_then(|k| k.as_str()).map(str::to_string),
+        _ => None,
     };
-    if keys.is_empty() {
-        DEFAULT_HOTKEYS.iter().map(|k| k.to_string()).collect()
-    } else {
-        keys
-    }
+    first.unwrap_or_else(|| DEFAULT_HOTKEY.to_string())
 }
 
 fn set_hotkey(key: &str) -> Result<(), String> {
@@ -1048,7 +1145,7 @@ fn command_run(sh: &Arc<Shared>, params: &Value) -> Value {
     match argv.as_slice() {
         [] => return json!({"result": {"picker": voice_picker(None)}}),
         ["--pick", "dictate"] => {
-            let key = hotkeys().remove(0);
+            let key = hotkey();
             return json!({"result": {"composer_action": key, "text": format!("dictation needs the gray prompt: press {}", key_label(&key))}});
         }
         ["--pick", pick] if pick.starts_with("hotkey:") => {
@@ -1299,11 +1396,16 @@ fn main() {
             let secs = args.get(1).and_then(|s| s.parse::<u64>().ok());
             let wav =
                 std::env::temp_dir().join(format!("voice-dictate-{}.wav", std::process::id()));
-            let ok = match secs {
-                Some(n) => record(&wav, &n.clamp(1, 60).to_string()),
-                None => record_live(&wav, hold_to_talk(), &key_label(&hotkeys()[0])),
+            let Some(n) = secs else {
+                let r = record_live(&wav, hold_to_talk(), &key_label(&hotkey()));
+                let _ = std::fs::remove_file(&wav);
+                if let Err(e) = r {
+                    eprintln!("no speech detected \u{2014} {e}");
+                    std::process::exit(1);
+                }
+                return;
             };
-            if !ok {
+            if !record(&wav, &n.clamp(1, 60).to_string()) {
                 eprintln!("recording failed");
                 std::process::exit(1);
             }
