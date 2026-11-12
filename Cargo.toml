@@ -1,8 +1,8 @@
 [package]
 name = "gray-voice"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Local TTS/STT voice tools for the gray agent harness"
 license = "MIT"
 [lib]
