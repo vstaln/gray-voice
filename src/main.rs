@@ -40,7 +40,7 @@ fn manifest() -> Value {
         ],
         "commands": ["/voice"], "subcommands": ["voice"],
         "composer_actions": [
-            {"id": "dictate", "keys": DEFAULT_HOTKEYS, "argv": ["dictate", "6"], "busy": "listening, then transcribing"},
+            {"id": "dictate", "keys": DEFAULT_HOTKEYS, "argv": ["dictate"], "busy": "listening"},
         ],
     })
 }
@@ -120,6 +120,130 @@ fn record(out: &std::path::Path, secs: &str) -> bool {
             .args(["-d", "-r", "16000", "-c", "1", "-b", "16"])
             .arg(out)
             .args(["trim", "0", secs]))
+}
+
+/// Record until gray reports the hotkey pressed again (or released, in
+/// hold mode) on stdin as `down`/`up` lines, showing a level meter on
+/// stderr, which gray displays as the status line.
+fn record_live(out: &std::path::Path, hold: bool, key: &str) -> bool {
+    use std::io::BufRead;
+    use std::time::{Duration, Instant};
+    let mut cmd = if have("pw-record") {
+        let mut c = Command::new("pw-record");
+        c.args(["--rate", "16000", "--channels", "1", "--format", "s16"]);
+        c
+    } else if have("arecord") {
+        let mut c = Command::new("arecord");
+        c.args(["-q", "-f", "S16_LE", "-r", "16000", "-c", "1"]);
+        c
+    } else {
+        let mut c = Command::new("sox");
+        c.args(["-q", "-d", "-r", "16000", "-c", "1", "-b", "16"]);
+        c
+    };
+    let Ok(mut rec) = cmd
+        .arg(out)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::stdin().lock().lines().map_while(Result::ok) {
+            if tx.send(line.trim() == "down").is_err() {
+                break;
+            }
+        }
+    });
+    let hint = if hold {
+        format!("release {key} to stop")
+    } else {
+        format!("press {key} to stop")
+    };
+    let start = Instant::now();
+    let mut last_down = start;
+    let mut levels: VecDeque<usize> = VecDeque::new();
+    loop {
+        std::thread::sleep(Duration::from_millis(100));
+        let mut stop = false;
+        while let Ok(down) = rx.try_recv() {
+            let now = Instant::now();
+            if !down {
+                stop |= hold;
+                continue;
+            }
+            // In press mode a new press stops; key auto-repeat from the
+            // opening press (or a held key) arrives early or in a tight stream.
+            if !hold
+                && now - start > Duration::from_millis(700)
+                && now - last_down > Duration::from_millis(150)
+            {
+                stop = true;
+            }
+            last_down = now;
+        }
+        // Terminals that never report key release still auto-repeat a held
+        // key, so a pause in repeats means it was let go.
+        if hold && last_down.elapsed() > Duration::from_millis(800) {
+            stop = true;
+        }
+        if start.elapsed() > Duration::from_secs(120) || !matches!(rec.try_wait(), Ok(None)) {
+            stop = true;
+        }
+        levels.push_back(level_now(out));
+        if levels.len() > 16 {
+            levels.pop_front();
+        }
+        let meter: String = levels
+            .iter()
+            .map(|&i| {
+                [
+                    '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}',
+                    '\u{2587}', '\u{2588}',
+                ][i]
+            })
+            .collect();
+        eprintln!(
+            "listening {meter:\u{2581}<16} {}s  {hint}",
+            start.elapsed().as_secs()
+        );
+        if stop {
+            break;
+        }
+    }
+    let _ = Command::new("kill")
+        .args(["-INT", &rec.id().to_string()])
+        .status();
+    let _ = rec.wait();
+    eprintln!("transcribing");
+    std::fs::metadata(out).is_ok_and(|m| m.len() > 44)
+}
+
+/// Level of the last 0.1 s written to the WAV, 0..=7 on a log scale.
+fn level_now(path: &std::path::Path) -> usize {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return 0;
+    };
+    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+    if len < 44 + 3200 {
+        return 0;
+    }
+    let mut buf = vec![0u8; 3200];
+    if f.seek(SeekFrom::Start((len - 3200) & !1)).is_err() || f.read_exact(&mut buf).is_err() {
+        return 0;
+    }
+    let mean = buf
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| f64::from(i16::from_le_bytes([b[0], b[1]])).abs())
+        .sum::<f64>()
+        / 1600.0;
+    (((mean.max(1.0).ln() - 5.0) / 3.5 * 7.0).clamp(0.0, 7.0)) as usize
 }
 
 /// Mean |i16| over WAV data; below VOICE_RMS (default 150) the chunk is
@@ -520,30 +644,54 @@ fn key_state(p: &Stt) -> &'static str {
     }
 }
 
+fn hold_to_talk() -> bool {
+    read_config()["dictate_mode"] == "hold"
+}
+
 fn voice_picker(selected: Option<&str>) -> Value {
-    let mut items: Vec<Value> = stt_providers()
-        .iter()
-        .map(|p| {
-            json!({
-                "id": p.id,
-                "label": format!("{} {}", if stt_enabled(p) { "●" } else { "○" }, p.name),
-                "description": format!("{} · {}", key_state(p), p.free),
-            })
-        })
-        .collect();
     let keys = hotkeys()
         .iter()
         .map(|k| key_label(k))
         .collect::<Vec<_>>()
         .join(" or ");
-    items.insert(0, json!({"id": "dictate", "label": "  Dictate now", "description": format!("or press {keys} at the prompt")}));
-    items.insert(1, json!({"id": "hotkey", "label": "  Hotkey", "description": format!("{keys} \u{b7} Enter to change")}));
+    let key = key_label(&hotkeys()[0]);
+    let mode = if hold_to_talk() {
+        format!("Hold {key} while you talk")
+    } else {
+        format!("Press {key} to start and stop")
+    };
+    let mut items = vec![
+        json!({"id": "dictate", "label": "Dictate now", "description": format!("or press {keys} at the prompt")}),
+        json!({"id": "hotkey", "label": "Hotkey", "description": format!("{keys} \u{b7} Enter, then press a new key"),
+               "capture_key": "Press the new dictation key"}),
+        json!({"id": "mode", "label": "Mode", "description": format!("{mode} \u{b7} Enter to switch")}),
+    ];
+    let providers = stt_providers();
+    let off = providers.iter().filter(|p| !stt_enabled(p)).count();
+    for p in providers.iter().filter(|p| stt_enabled(p)) {
+        items.push(json!({"id": p.id, "label": format!("\u{25cf} {}", p.name), "description": format!("{} \u{b7} {}", key_state(p), p.free)}));
+    }
+    items.push(json!({"id": "more", "label": "More providers", "description": format!("{off} off \u{b7} add your own")}));
+    json!({"title": "Voice", "items": items, "selected_id": selected})
+}
+
+fn providers_picker(selected: Option<&str>) -> Value {
+    let mut items: Vec<Value> = stt_providers()
+        .iter()
+        .map(|p| {
+            json!({
+                "id": format!("more:{}", p.id),
+                "label": format!("{} {}", if stt_enabled(p) { "\u{25cf}" } else { "\u{25cb}" }, p.name),
+                "description": format!("{} \u{b7} {}", key_state(p), p.free),
+            })
+        })
+        .collect();
     items.push(json!({"id": "add", "label": "+ Add your own", "description": "any OpenAI-compatible endpoint"}));
     json!({
-        "title": "Speech to text",
+        "title": "Speech to text providers",
         "items": items,
         "selected_id": selected,
-        "footer": "Enter on a provider turns it on or off",
+        "footer": "Enter turns a provider on or off",
     })
 }
 
@@ -774,16 +922,6 @@ fn config_path() -> std::path::PathBuf {
 }
 
 const DEFAULT_HOTKEYS: [&str; 2] = ["ctrl+space", "f8"];
-const HOTKEY_CHOICES: [&str; 8] = [
-    "ctrl+space",
-    "f8",
-    "f9",
-    "f12",
-    "alt+s",
-    "alt+m",
-    "ctrl+]",
-    "alt+space",
-];
 /// gray's keymap entry for the dictation action (see gray keybindings.json).
 const HOTKEY_ID: &str = "plugin.voice.dictate";
 
@@ -835,21 +973,6 @@ fn key_label(key: &str) -> String {
         .join("+")
 }
 
-fn hotkey_picker() -> Value {
-    let current = hotkeys();
-    let items: Vec<Value> = HOTKEY_CHOICES
-        .iter()
-        .map(|k| {
-            let on = current.iter().any(|c| c == k);
-            json!({"id": format!("key:{k}"), "label": format!("{} {}", if on { "\u{25cf}" } else { "\u{25cb}" }, key_label(k))})
-        })
-        .collect();
-    json!({
-        "title": "Dictation hotkey",
-        "items": items,
-        "footer": "Works from the gray prompt · other keys: keybindings.json",
-    })
-}
 fn read_config() -> Value {
     std::fs::read_to_string(config_path())
         .ok()
@@ -928,24 +1051,46 @@ fn command_run(sh: &Arc<Shared>, params: &Value) -> Value {
             let key = hotkeys().remove(0);
             return json!({"result": {"composer_action": key, "text": format!("dictation needs the gray prompt: press {}", key_label(&key))}});
         }
-        ["--pick", "hotkey"] => return json!({"result": {"picker": hotkey_picker()}}),
-        ["--pick", pick] if pick.starts_with("key:") => {
-            return match set_hotkey(&pick[4..]) {
+        ["--pick", pick] if pick.starts_with("hotkey:") => {
+            let key = &pick["hotkey:".len()..];
+            if !key.contains('+')
+                && !(key.starts_with('f') && key.len() > 1 && key[1..].parse::<u8>().is_ok())
+            {
+                return json!({"result": {"text": format!("{} would type into the prompt; pick an F key or a combo like Ctrl+Space", key_label(key))}});
+            }
+            return match set_hotkey(key) {
                 Ok(()) => json!({"result": {"picker": voice_picker(Some("hotkey"))}}),
                 Err(e) => json!({"result": {"text": format!("hotkey not saved: {e}")}}),
             };
         }
+        ["--pick", "mode"] => {
+            let next = if hold_to_talk() { "press" } else { "hold" };
+            if let Err(e) = update_config(|c| c["dictate_mode"] = json!(next)) {
+                return json!({"result": {"text": format!("mode not saved: {e}")}});
+            }
+            return json!({"result": {"picker": voice_picker(Some("mode"))}});
+        }
+        ["--pick", "more"] => return json!({"result": {"picker": providers_picker(None)}}),
         ["--pick", "add"] | ["add"] => return json!({"result": {"text": add_custom(&["add"])}}),
         ["add", ..] => return json!({"result": {"text": add_custom(&argv)}}),
         ["remove", id] => return json!({"result": {"text": remove_custom(id)}}),
-        ["--pick", id] => {
+        ["--pick", pick] => {
+            let (more, id) = match pick.strip_prefix("more:") {
+                Some(id) => (true, id),
+                None => (false, *pick),
+            };
             let Some(p) = find_stt(id) else {
                 return json!({"result": {"text": format!("unknown provider {id}")}});
             };
             if let Err(e) = stt_toggle(&p, !stt_enabled(&p)) {
                 return json!({"result": {"text": format!("{id}: config not saved: {e}")}});
             }
-            return json!({"result": {"picker": voice_picker(Some(id))}});
+            let picker = if more {
+                providers_picker(Some(pick))
+            } else {
+                voice_picker(Some(id))
+            };
+            return json!({"result": {"picker": picker}});
         }
         _ => {}
     }
@@ -1151,15 +1296,14 @@ fn main() {
                 eprintln!("no recorder (pw-record/arecord/sox)");
                 std::process::exit(1);
             }
-            let secs = args
-                .get(1)
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(6)
-                .clamp(1, 60)
-                .to_string();
+            let secs = args.get(1).and_then(|s| s.parse::<u64>().ok());
             let wav =
                 std::env::temp_dir().join(format!("voice-dictate-{}.wav", std::process::id()));
-            if !record(&wav, &secs) {
+            let ok = match secs {
+                Some(n) => record(&wav, &n.clamp(1, 60).to_string()),
+                None => record_live(&wav, hold_to_talk(), &key_label(&hotkeys()[0])),
+            };
+            if !ok {
                 eprintln!("recording failed");
                 std::process::exit(1);
             }
