@@ -64,13 +64,25 @@ fn have(bin: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
-        || Command::new("which")
-            .arg(bin)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+        || in_path(bin)
+}
+
+fn in_path(bin: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let dirs: Vec<_> = std::env::split_paths(&paths).collect();
+    if dirs.iter().any(|d| d.join(bin).is_file()) {
+        return true;
+    }
+    if cfg!(windows) {
+        let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+        return pathext
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .any(|ext| dirs.iter().any(|d| d.join(format!("{bin}{ext}")).is_file()));
+    }
+    false
 }
 
 fn pick(cands: &[&str]) -> Option<String> {
@@ -265,9 +277,13 @@ fn record_live(out: &std::path::Path, hold: bool, key: &str) -> Result<usize, St
             break;
         }
     }
-    let _ = Command::new("kill")
+    let interrupted = Command::new("kill")
         .args(["-INT", &rec.id().to_string()])
-        .status();
+        .status()
+        .is_ok_and(|s| s.success());
+    if !interrupted {
+        let _ = rec.kill();
+    }
     let _ = rec.wait();
     let data_at = seg_start.unwrap_or_else(|| wav_data_offset(out).unwrap_or(44));
     let len = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
@@ -280,6 +296,58 @@ fn record_live(out: &std::path::Path, hold: bool, key: &str) -> Result<usize, St
     worker
         .join()
         .unwrap_or_else(|_| Err("transcriber crashed".into()))
+}
+
+fn piper_say(text: &str) -> std::io::Result<std::process::ExitStatus> {
+    let wav = std::env::temp_dir().join(format!("voice-say-{}.wav", std::process::id()));
+    let mut child = Command::new("piper")
+        .arg("-f")
+        .arg(&wav)
+        .stdin(Stdio::piped())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(text.as_bytes());
+    }
+    let st = child.wait()?;
+    if !st.success() {
+        let _ = std::fs::remove_file(&wav);
+        return Ok(st);
+    }
+    let played = play_wav(&wav);
+    let _ = std::fs::remove_file(&wav);
+    played
+}
+
+#[cfg(windows)]
+fn play_wav(wav: &std::path::Path) -> std::io::Result<std::process::ExitStatus> {
+    let script = format!(
+        "(New-Object Media.SoundPlayer '{}').PlaySync()",
+        wav.display().to_string().replace('\'', "''")
+    );
+    Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .stdin(Stdio::null())
+        .status()
+}
+
+#[cfg(not(windows))]
+fn play_wav(wav: &std::path::Path) -> std::io::Result<std::process::ExitStatus> {
+    let players: [(&str, &[&str]); 5] = [
+        ("afplay", &[]),
+        ("aplay", &["-q"]),
+        ("paplay", &[]),
+        ("ffplay", &["-nodisp", "-autoexit", "-loglevel", "error"]),
+        ("play", &["-q"]),
+    ];
+    for (bin, args) in players {
+        if have(bin) {
+            return Command::new(bin).args(args).arg(wav).status();
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "no wav player (afplay/aplay/paplay/ffplay/play)",
+    ))
 }
 
 fn voice_gate() -> f64 {
@@ -478,10 +546,7 @@ fn voice_say(a: &Value) -> Result<String, String> {
     let st = match e.as_str() {
         "say" => Command::new("say").args(["-r", &rate, text]).status(),
         "espeak-ng" | "espeak" => Command::new(&e).args(["-s", &rate, text]).status(),
-        "piper" => Command::new("sh")
-            .args(["-c", "printf %s \"$0\" | piper --stdout | aplay -q"])
-            .arg(text)
-            .status(),
+        "piper" => piper_say(text),
         "spd-say" => Command::new("spd-say").arg(text).status(),
         other => return Err(format!("unknown engine {other}")),
     }
