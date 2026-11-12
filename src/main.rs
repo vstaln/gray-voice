@@ -263,48 +263,118 @@ fn voice_listen(a: &Value) -> Result<String, String> {
 }
 
 struct Stt {
-    id: &'static str,
-    label: &'static str,
-    free: &'static str,
-    key: Option<&'static str>,
-    model: &'static str,
-    url: &'static str,
+    id: String,
+    name: String,
+    free: String,
+    key: Option<String>,
+    model: String,
+    url: String,
 }
 
-const STT: &[Stt] = &[
+fn stt(id: &str, name: &str, free: &str, key: bool, model: &str, url: &str) -> Stt {
     Stt {
-        id: "groq",
-        label: "groq whisper-large-v3-turbo",
-        free: "free 28,800 s/day",
-        key: Some("groq"),
-        model: "whisper-large-v3-turbo",
-        url: "https://api.groq.com/openai/v1/audio/transcriptions",
-    },
-    Stt {
-        id: "xai",
-        label: "xai grok-voice-transcribe-2.0",
-        free: "paid ~$0.20/hr",
-        key: Some("xai"),
-        model: "grok-voice-transcribe-2.0",
-        url: "https://api.x.ai/v1/audio/transcriptions",
-    },
-    Stt {
-        id: "cloudflare",
-        label: "cf whisper-large-v3-turbo",
-        free: "free ~214 min/day",
-        key: None,
-        model: "@cf/openai/whisper-large-v3-turbo",
-        url: "",
-    },
-    Stt {
-        id: "local",
-        label: "local whisper.cpp",
-        free: "free, offline",
-        key: None,
-        model: "",
-        url: "",
-    },
-];
+        id: id.into(),
+        name: name.into(),
+        free: free.into(),
+        key: key.then(|| id.to_string()),
+        model: model.into(),
+        url: url.into(),
+    }
+}
+
+fn stt_providers() -> Vec<Stt> {
+    let mut all = vec![
+        stt(
+            "groq",
+            "Groq",
+            "free 28,800 s/day",
+            true,
+            "whisper-large-v3-turbo",
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+        ),
+        stt(
+            "xai",
+            "xAI",
+            "paid ~$0.20/hr",
+            true,
+            "grok-voice-transcribe-2.0",
+            "https://api.x.ai/v1/audio/transcriptions",
+        ),
+        stt(
+            "cloudflare",
+            "Cloudflare",
+            "free ~214 min/day",
+            false,
+            "@cf/openai/whisper-large-v3-turbo",
+            "",
+        ),
+        stt("local", "Local", "free, offline", false, "", ""),
+    ];
+    for c in read_config()["custom"].as_array().into_iter().flatten() {
+        let (Some(id), Some(url), Some(model)) =
+            (c["id"].as_str(), c["url"].as_str(), c["model"].as_str())
+        else {
+            continue;
+        };
+        all.push(stt(id, id, "your endpoint", true, model, url));
+    }
+    all
+}
+
+fn find_stt(id: &str) -> Option<Stt> {
+    stt_providers().into_iter().find(|p| p.id == id)
+}
+
+fn add_custom(argv: &[&str]) -> String {
+    let [_, id, url, model] = argv else {
+        return "usage: /voice add <name> <url> <model>   (an OpenAI-compatible /audio/transcriptions URL)".into();
+    };
+    if id.is_empty()
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        || *id == "add"
+        || *id == "remove"
+    {
+        return "the name may use letters, digits, - and _".into();
+    }
+    if model.starts_with(['@', '<']) {
+        return "the model name cannot start with @ or <".into();
+    }
+    if find_stt(id).is_some() {
+        return format!("{id} already exists");
+    }
+    if !url.starts_with("https://")
+        && !url.starts_with("http://localhost")
+        && !url.starts_with("http://127.0.0.1")
+    {
+        return "the URL must be https (or http on localhost)".into();
+    }
+    let r = update_config(|c| {
+        let mut list = c["custom"].as_array().cloned().unwrap_or_default();
+        list.push(json!({"id": id, "url": url, "model": model}));
+        c["custom"] = json!(list);
+    });
+    match r.and_then(|()| find_stt(id).map_or(Ok(()), |p| stt_toggle(&p, true))) {
+        Ok(()) => format!("{id} added and on. Set its key in a shell: gray voice key {id}"),
+        Err(e) => format!("{id}: config not saved: {e}"),
+    }
+}
+
+fn remove_custom(id: &str) -> String {
+    let r = update_config(|c| {
+        if let Some(list) = c["custom"].as_array_mut() {
+            list.retain(|e| e["id"].as_str() != Some(id));
+        }
+        if let Some(list) = c["stt"].as_array_mut() {
+            list.retain(|e| e.as_str() != Some(id));
+        }
+    });
+    match r {
+        Ok(()) => format!("{id} removed"),
+        Err(e) => format!("{id}: config not saved: {e}"),
+    }
+}
 
 fn keys_path() -> std::path::PathBuf {
     config_path().with_file_name("keys.json")
@@ -328,7 +398,7 @@ fn write_keys(v: &Value) -> std::io::Result<()> {
 }
 
 fn provider_key(p: &Stt) -> Option<String> {
-    let field = p.key?;
+    let field = p.key.as_deref()?;
     read_keys()[field]
         .as_str()
         .map(str::to_string)
@@ -338,34 +408,40 @@ fn provider_key(p: &Stt) -> Option<String> {
 
 fn stt_enabled(p: &Stt) -> bool {
     match read_config()["stt"].as_array() {
-        Some(list) => list.iter().any(|v| v.as_str() == Some(p.id)),
-        None => p.key.map_or(p.id == "local", |_| provider_key(p).is_some()),
+        Some(list) => list.iter().any(|v| v.as_str() == Some(p.id.as_str())),
+        None => p
+            .key
+            .as_ref()
+            .map_or(p.id == "local", |_| provider_key(p).is_some()),
     }
 }
 
 fn stt_toggle(p: &Stt, on: bool) -> Result<(), String> {
     update_config(|c| {
-        let mut ids: Vec<String> = STT
+        let mut ids: Vec<String> = stt_providers()
             .iter()
             .filter(|q| stt_enabled(q))
             .map(|q| q.id.to_string())
             .collect();
-        if on && !ids.iter().any(|i| i == p.id) {
-            ids.insert(0, p.id.to_string());
+        if on && !ids.contains(&p.id) {
+            ids.insert(0, p.id.clone());
         }
         if !on {
-            ids.retain(|i| i != p.id);
+            ids.retain(|i| *i != p.id);
         }
         c["stt"] = json!(ids);
     })
 }
 
 fn stt_ready() -> bool {
-    STT.iter().filter(|p| stt_enabled(p)).any(|p| match p.id {
-        "local" => pick(&["whisper-cli", "whisper", "main", "whisper-cpp"]).is_some(),
-        "cloudflare" => have("cf"),
-        _ => provider_key(p).is_some(),
-    })
+    stt_providers()
+        .iter()
+        .filter(|p| stt_enabled(p))
+        .any(|p| match p.id.as_str() {
+            "local" => pick(&["whisper-cli", "whisper", "main", "whisper-cpp"]).is_some(),
+            "cloudflare" => have("cf"),
+            _ => provider_key(p).is_some(),
+        })
 }
 
 fn update_config(f: impl FnOnce(&mut Value)) -> Result<(), String> {
@@ -388,12 +464,12 @@ fn update_config(f: impl FnOnce(&mut Value)) -> Result<(), String> {
     r.map_err(|e| e.to_string())
 }
 fn stt_json() -> String {
-    let rows: Vec<Value> = STT
+    let rows: Vec<Value> = stt_providers()
         .iter()
         .map(|p| {
             json!({
                 "id": p.id,
-                "label": p.label,
+                "label": p.name,
                 "enabled": stt_enabled(p),
                 "key": match p.key {
                     Some(_) => if provider_key(p).is_some() { "set" } else { "missing" },
@@ -417,52 +493,36 @@ fn key_state(p: &Stt) -> &'static str {
     }
 }
 
-fn voice_picker(sh: &Shared, selected: Option<&str>) -> Value {
-    let listening = sh.enabled.load(Ordering::Relaxed);
-    let mut items = vec![
-        json!({
-            "id": "listen",
-            "label": format!("hands-free listening   {}", if listening { "on" } else { "off" }),
-            "description": "hears you all the time, sends when you pause",
-        }),
-        json!({
-            "id": "test",
-            "label": "test the microphone",
-            "description": "records 4 s after Enter, then prints the text",
-        }),
-    ];
-    items.extend(STT.iter().map(|p| {
-        json!({
-            "id": p.id,
-            "label": format!("{} {}", if stt_enabled(p) { "●" } else { "○" }, p.label),
-            "description": format!("{} · {}", key_state(p), p.free),
+fn voice_picker(selected: Option<&str>) -> Value {
+    let mut items: Vec<Value> = stt_providers()
+        .iter()
+        .map(|p| {
+            json!({
+                "id": p.id,
+                "label": format!("{} {}", if stt_enabled(p) { "●" } else { "○" }, p.name),
+                "description": format!("{} · {}", key_state(p), p.free),
+            })
         })
-    }));
-    let mic = pick(&["arecord", "sox"]).unwrap_or("none".into());
-    let speaker =
-        pick(&["say", "espeak-ng", "espeak", "piper", "spd-say"]).unwrap_or("none".into());
+        .collect();
+    items.push(json!({"id": "add", "label": "+ Add your own", "description": "any OpenAI-compatible endpoint"}));
     json!({
-        "title": "voice",
+        "title": "Speech to text",
         "items": items,
         "selected_id": selected,
-        "footer": format!(
-            "dictate with ctrl+space or F8 · mic {mic} · speaker {speaker}\n\
-             ● providers are tried top to bottom · set a key with: gray voice key <id>\n\
-             Enter toggles or runs · Esc closes"
-        ),
+        "footer": "Enter turns on or off · ctrl+space or F8 dictates",
     })
 }
 
 fn stt_panel() -> String {
     let mut out = String::from("voice · speech to text\n");
-    for p in STT {
+    for p in &stt_providers() {
         let on = stt_enabled(p);
         let key = key_state(p);
         out.push_str(&format!(
             "  {} {:<10} {:<30} {:<12} {}\n",
             if on { "on " } else { "off" },
             p.id,
-            p.label,
+            p.name,
             key,
             p.free
         ));
@@ -498,7 +558,7 @@ fn transcribe_api(p: &Stt, key: &str, wav: &std::path::Path) -> Result<String, S
             "-",
             "-X",
             "POST",
-            p.url,
+            &p.url,
             "-F",
             &format!("file=@{}", wav.display()),
             "-F",
@@ -581,10 +641,10 @@ fn transcribe_cf(wav: &std::path::Path) -> Result<String, String> {
 }
 
 fn stt_transcribe(wav: &std::path::Path) -> Result<String, String> {
-    let enabled: Vec<&Stt> = STT.iter().filter(|p| stt_enabled(p)).collect();
+    let enabled: Vec<Stt> = stt_providers().into_iter().filter(stt_enabled).collect();
     let mut err = String::new();
-    for p in enabled {
-        let r = match p.id {
+    for p in &enabled {
+        let r = match p.id.as_str() {
             "local" => match pick(&["whisper-cli", "whisper", "main", "whisper-cpp"]) {
                 Some(w) => {
                     let model = std::env::var("VOICE_MODEL")
@@ -721,24 +781,18 @@ fn command_run(sh: &Arc<Shared>, params: &Value) -> Value {
         .map(|a| a.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
     match argv.as_slice() {
-        [] => return json!({"result": {"picker": voice_picker(sh, None)}}),
-        ["--pick", "listen"] => {
-            let on = !sh.enabled.load(Ordering::Relaxed);
-            let text = set_listen(sh, on);
-            if sh.enabled.load(Ordering::Relaxed) != on {
-                return json!({"result": {"text": text}});
-            }
-            return json!({"result": {"picker": voice_picker(sh, Some("listen"))}});
-        }
-        ["--pick", "test"] => return json!({"result": {"text": voice_test()}}),
+        [] => return json!({"result": {"picker": voice_picker(None)}}),
+        ["--pick", "add"] | ["add"] => return json!({"result": {"text": add_custom(&["add"])}}),
+        ["add", ..] => return json!({"result": {"text": add_custom(&argv)}}),
+        ["remove", id] => return json!({"result": {"text": remove_custom(id)}}),
         ["--pick", id] => {
-            let Some(p) = STT.iter().find(|p| p.id == *id) else {
+            let Some(p) = find_stt(id) else {
                 return json!({"result": {"text": format!("unknown provider {id}")}});
             };
-            if let Err(e) = stt_toggle(p, !stt_enabled(p)) {
+            if let Err(e) = stt_toggle(&p, !stt_enabled(&p)) {
                 return json!({"result": {"text": format!("{id}: config not saved: {e}")}});
             }
-            return json!({"result": {"picker": voice_picker(sh, Some(id))}});
+            return json!({"result": {"picker": voice_picker(Some(id))}});
         }
         _ => {}
     }
@@ -765,7 +819,7 @@ fn command_run(sh: &Arc<Shared>, params: &Value) -> Value {
                 .and_then(|a| a.get(1))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            match STT.iter().find(|p| p.id == id) {
+            match find_stt(id) {
                 Some(p) if p.key.is_some() => {
                     format!("set the {id} key with: voice key {id} (reads one line from stdin)")
                 }
@@ -773,15 +827,15 @@ fn command_run(sh: &Arc<Shared>, params: &Value) -> Value {
                 None => format!("unknown provider {id}"),
             }
         }
-        verb2 if STT.iter().any(|p| p.id == verb2) => {
-            let p = STT.iter().find(|p| p.id == verb2).unwrap();
+        verb2 if find_stt(verb2).is_some() => {
+            let p = find_stt(verb2).unwrap();
             let on = params["argv"]
                 .as_array()
                 .and_then(|a| a.get(1))
                 .and_then(Value::as_str)
                 .map(|v| v != "off")
                 .unwrap_or(true);
-            match stt_toggle(p, on) {
+            match stt_toggle(&p, on) {
                 Ok(()) => format!("{verb2} {}", if on { "on" } else { "off" }),
                 Err(e) => format!("{verb2}: config not saved: {e}"),
             }
@@ -968,11 +1022,11 @@ fn main() {
         }
         Some("key") => {
             let id = args.get(1).map(String::as_str).unwrap_or("");
-            let Some(p) = STT.iter().find(|p| p.id == id) else {
+            let Some(p) = find_stt(id) else {
                 eprintln!("unknown provider {id}");
                 std::process::exit(1);
             };
-            let Some(field) = p.key else {
+            let Some(field) = p.key.as_deref() else {
                 println!("{id} needs no key");
                 return;
             };
@@ -991,10 +1045,10 @@ fn main() {
             }
             println!("{id} key saved");
         }
-        Some(p) if STT.iter().any(|s| s.id == p) => {
-            let s = STT.iter().find(|s| s.id == p).unwrap();
+        Some(p) if find_stt(p).is_some() => {
+            let s = find_stt(p).unwrap();
             let on = args.get(1).map(|v| v != "off").unwrap_or(true);
-            match stt_toggle(s, on) {
+            match stt_toggle(&s, on) {
                 Ok(()) => println!("{p} {}", if on { "on" } else { "off" }),
                 Err(e) => {
                     eprintln!("config not saved: {e}");
