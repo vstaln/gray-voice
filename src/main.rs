@@ -40,7 +40,7 @@ fn manifest() -> Value {
         ],
         "commands": ["/voice"], "subcommands": ["voice"],
         "composer_actions": [
-            {"keys": ["ctrl+space", "f8"], "argv": ["dictate", "6"], "busy": "listening, then transcribing"},
+            {"id": "dictate", "keys": DEFAULT_HOTKEYS, "argv": ["dictate", "6"], "busy": "listening, then transcribing"},
         ],
     })
 }
@@ -531,7 +531,13 @@ fn voice_picker(selected: Option<&str>) -> Value {
             })
         })
         .collect();
-    items.insert(0, json!({"id": "dictate", "label": "\u{25b6} Dictate now", "description": "ctrl+space or F8 from the prompt"}));
+    let keys = hotkeys()
+        .iter()
+        .map(|k| key_label(k))
+        .collect::<Vec<_>>()
+        .join(" or ");
+    items.insert(0, json!({"id": "dictate", "label": "  Dictate now", "description": format!("or press {keys} at the prompt")}));
+    items.insert(1, json!({"id": "hotkey", "label": "  Hotkey", "description": format!("{keys} \u{b7} Enter to change")}));
     items.push(json!({"id": "add", "label": "+ Add your own", "description": "any OpenAI-compatible endpoint"}));
     json!({
         "title": "Speech to text",
@@ -668,7 +674,35 @@ fn transcribe_cf(wav: &std::path::Path) -> Result<String, String> {
     }
 }
 
+/// Whisper turns room noise into a few stock phrases; a transcript that is
+/// only one of these (or only punctuation) heard nothing.
+fn is_silence_hallucination(t: &str) -> bool {
+    let norm: String = t
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect::<String>()
+        .trim()
+        .to_lowercase();
+    matches!(
+        norm.as_str(),
+        "" | "you"
+            | "thank you"
+            | "thanks"
+            | "thank you for watching"
+            | "thanks for watching"
+            | "bye"
+    )
+}
+
 fn stt_transcribe(wav: &std::path::Path) -> Result<String, String> {
+    let t = stt_transcribe_raw(wav)?;
+    if is_silence_hallucination(&t) {
+        return Err("heard only room noise".into());
+    }
+    Ok(t)
+}
+
+fn stt_transcribe_raw(wav: &std::path::Path) -> Result<String, String> {
     let enabled: Vec<Stt> = stt_providers().into_iter().filter(stt_enabled).collect();
     let mut err = String::new();
     for p in &enabled {
@@ -729,12 +763,92 @@ fn tool(name: &str, args: &Value) -> Value {
     }
 }
 
-fn config_path() -> std::path::PathBuf {
-    let home = std::env::var_os("GRAY_HOME")
+fn gray_home() -> std::path::PathBuf {
+    std::env::var_os("GRAY_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".gray")))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    home.join("voice").join("config.json")
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+fn config_path() -> std::path::PathBuf {
+    gray_home().join("voice").join("config.json")
+}
+
+const DEFAULT_HOTKEYS: [&str; 2] = ["ctrl+space", "f8"];
+const HOTKEY_CHOICES: [&str; 8] = [
+    "ctrl+space",
+    "f8",
+    "f9",
+    "f12",
+    "alt+s",
+    "alt+m",
+    "ctrl+]",
+    "alt+space",
+];
+/// gray's keymap entry for the dictation action (see gray keybindings.json).
+const HOTKEY_ID: &str = "plugin.voice.dictate";
+
+/// The dictation keys: the user's keybindings.json entry, else the defaults.
+fn hotkeys() -> Vec<String> {
+    let user = std::fs::read_to_string(gray_home().join("keybindings.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Value>(&t).ok())
+        .and_then(|v| v.get(HOTKEY_ID).cloned());
+    let keys: Vec<String> = match user {
+        Some(Value::String(k)) => vec![k],
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|k| k.as_str().map(str::to_string))
+            .collect(),
+        _ => Vec::new(),
+    };
+    if keys.is_empty() {
+        DEFAULT_HOTKEYS.iter().map(|k| k.to_string()).collect()
+    } else {
+        keys
+    }
+}
+
+fn set_hotkey(key: &str) -> Result<(), String> {
+    let path = gray_home().join("keybindings.json");
+    let mut map = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Map<String, Value>>(&t).ok())
+        .unwrap_or_default();
+    map.insert(HOTKEY_ID.into(), json!([key]));
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&map).unwrap_or_default() + "\n",
+    )
+    .map_err(|e| e.to_string())
+}
+
+/// `ctrl+space` -> `Ctrl+Space`, `f8` -> `F8`.
+fn key_label(key: &str) -> String {
+    key.split('+')
+        .map(|p| {
+            let mut c = p.chars();
+            c.next()
+                .map(|f| f.to_uppercase().chain(c).collect())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<String>>()
+        .join("+")
+}
+
+fn hotkey_picker() -> Value {
+    let current = hotkeys();
+    let items: Vec<Value> = HOTKEY_CHOICES
+        .iter()
+        .map(|k| {
+            let on = current.iter().any(|c| c == k);
+            json!({"id": format!("key:{k}"), "label": format!("{} {}", if on { "\u{25cf}" } else { "\u{25cb}" }, key_label(k))})
+        })
+        .collect();
+    json!({
+        "title": "Dictation hotkey",
+        "items": items,
+        "footer": "Works from the gray prompt · other keys: keybindings.json",
+    })
 }
 fn read_config() -> Value {
     std::fs::read_to_string(config_path())
@@ -811,7 +925,15 @@ fn command_run(sh: &Arc<Shared>, params: &Value) -> Value {
     match argv.as_slice() {
         [] => return json!({"result": {"picker": voice_picker(None)}}),
         ["--pick", "dictate"] => {
-            return json!({"result": {"composer_action": "f8", "text": "dictation needs the gray prompt: press ctrl+space or F8"}});
+            let key = hotkeys().remove(0);
+            return json!({"result": {"composer_action": key, "text": format!("dictation needs the gray prompt: press {}", key_label(&key))}});
+        }
+        ["--pick", "hotkey"] => return json!({"result": {"picker": hotkey_picker()}}),
+        ["--pick", pick] if pick.starts_with("key:") => {
+            return match set_hotkey(&pick[4..]) {
+                Ok(()) => json!({"result": {"picker": voice_picker(Some("hotkey"))}}),
+                Err(e) => json!({"result": {"text": format!("hotkey not saved: {e}")}}),
+            };
         }
         ["--pick", "add"] | ["add"] => return json!({"result": {"text": add_custom(&["add"])}}),
         ["add", ..] => return json!({"result": {"text": add_custom(&argv)}}),
