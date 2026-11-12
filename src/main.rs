@@ -7,7 +7,7 @@
 //! `host.turn`), with `prompt/context` as the pull fallback. Everything
 //! is binary-detected; absent pieces fail with install hints.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, IsTerminal, Write};
 use std::process::{Command, Stdio};
@@ -428,7 +428,12 @@ fn stt_picker(selected: Option<&str>) -> Value {
             })
         })
         .collect();
-    json!({"title": "voice · speech to text (Enter toggles)", "items": items, "selected_id": selected})
+    json!({
+        "title": "voice · speech to text",
+        "items": items,
+        "selected_id": selected,
+        "footer": "ctrl+space or F8 dictates · Enter turns a provider on or off · Esc closes",
+    })
 }
 
 fn stt_panel() -> String {
@@ -654,11 +659,20 @@ fn status(sh: &Shared) -> String {
     let model = std::env::var("VOICE_MODEL")
         .or_else(|_| std::env::var("WHISPER_MODEL"))
         .unwrap_or("(whisper default)".into());
-    format!("voice\n  listening: {}\n  push: {}\n  queued: {}\n  tts: {tts}\n  stt: {stt}\n  model: {model}\n  mic: {rec}",
-        if sh.enabled.load(Ordering::Relaxed) { "on" } else { "off" },
-        if sh.denied.load(Ordering::Relaxed) { "pull only (host.turn denied)" }
-            else { "host/run" },
-        sh.heard.lock().unwrap().len())
+    format!(
+        "voice\n  listening: {}\n  push: {}\n  queued: {}\n  tts: {tts}\n  stt: {stt}\n  model: {model}\n  mic: {rec}",
+        if sh.enabled.load(Ordering::Relaxed) {
+            "on"
+        } else {
+            "off"
+        },
+        if sh.denied.load(Ordering::Relaxed) {
+            "pull only (host.turn denied)"
+        } else {
+            "host/run"
+        },
+        sh.heard.lock().unwrap().len()
+    )
 }
 
 fn command_run(sh: &Arc<Shared>, params: &Value) -> Value {
@@ -852,16 +866,28 @@ fn main() {
     };
     match args.first().map(String::as_str) {
         Some("manifest") => println!("{}", manifest()),
-        Some("sidecar") => { let _ = sidecar(); }
-        Some("status") => println!("{}", status(&Shared {
-            enabled: AtomicBool::new(read_config()["listen"].as_bool().unwrap_or(false)),
-            pump_q: Mutex::new(VecDeque::new()), cv: Condvar::new(),
-            heard: Mutex::new(VecDeque::new()),
-            inflight: Mutex::new(HashMap::new()), denied: AtomicBool::new(false),
-            seq: AtomicU64::new(0), listener_started: AtomicBool::new(false) })),
+        Some("sidecar") => {
+            let _ = sidecar();
+        }
+        Some("status") => println!(
+            "{}",
+            status(&Shared {
+                enabled: AtomicBool::new(read_config()["listen"].as_bool().unwrap_or(false)),
+                pump_q: Mutex::new(VecDeque::new()),
+                cv: Condvar::new(),
+                heard: Mutex::new(VecDeque::new()),
+                inflight: Mutex::new(HashMap::new()),
+                denied: AtomicBool::new(false),
+                seq: AtomicU64::new(0),
+                listener_started: AtomicBool::new(false)
+            })
+        ),
         Some("stt") | Some("panel") => {
-            if args.iter().any(|a| a == "--json") { println!("{}", stt_json()) }
-            else { println!("{}", stt_panel()) }
+            if args.iter().any(|a| a == "--json") {
+                println!("{}", stt_json())
+            } else {
+                println!("{}", stt_panel())
+            }
         }
         Some("test") => println!("{}", voice_test()),
         Some("on") => {
@@ -874,7 +900,9 @@ fn main() {
                 eprintln!("config not saved: {e}");
                 std::process::exit(1);
             }
-            println!("listening on (persisted — ambient mode starts when the sidecar loads; /voice on for the live session)");
+            println!(
+                "listening on (persisted — ambient mode starts when the sidecar loads; /voice on for the live session)"
+            );
         }
         Some("off") => {
             if let Err(e) = persist_enabled(false) {
@@ -885,34 +913,48 @@ fn main() {
         }
         Some("dictate") => {
             if !have("arecord") && !have("sox") {
-                eprintln!("no recorder (arecord/sox)"); std::process::exit(1);
+                eprintln!("no recorder (arecord/sox)");
+                std::process::exit(1);
             }
-            let secs = args.get(1).and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(6).clamp(1, 60).to_string();
-            let wav = std::env::temp_dir()
-                .join(format!("voice-dictate-{}.wav", std::process::id()));
+            let secs = args
+                .get(1)
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(6)
+                .clamp(1, 60)
+                .to_string();
+            let wav =
+                std::env::temp_dir().join(format!("voice-dictate-{}.wav", std::process::id()));
             if !record(&wav, &secs) {
-                eprintln!("recording failed"); std::process::exit(1);
+                eprintln!("recording failed");
+                std::process::exit(1);
             }
             let t = stt_transcribe(&wav);
             let _ = std::fs::remove_file(&wav);
             match t {
                 Ok(t) => println!("{t}"),
-                Err(e) => { eprintln!("no speech detected — {e}"); std::process::exit(1); }
+                Err(e) => {
+                    eprintln!("no speech detected — {e}");
+                    std::process::exit(1);
+                }
             }
         }
         Some("key") => {
             let id = args.get(1).map(String::as_str).unwrap_or("");
             let Some(p) = STT.iter().find(|p| p.id == id) else {
-                eprintln!("unknown provider {id}"); std::process::exit(1);
+                eprintln!("unknown provider {id}");
+                std::process::exit(1);
             };
             let Some(field) = p.key else {
-                println!("{id} needs no key"); return;
+                println!("{id} needs no key");
+                return;
             };
             let mut line = String::new();
             let _ = std::io::stdin().lock().read_line(&mut line);
             let k = line.trim();
-            if k.is_empty() { eprintln!("no key on stdin"); std::process::exit(1); }
+            if k.is_empty() {
+                eprintln!("no key on stdin");
+                std::process::exit(1);
+            }
             let mut v = read_keys();
             v[field] = json!(k);
             if let Err(e) = write_keys(&v) {
@@ -932,23 +974,32 @@ fn main() {
                 }
             }
         }
-        Some("-h") | Some("--help") | Some("help") =>
-            println!("voice — TTS/STT.\n  voice status|stt|test|dictate [secs]|on|off\n  voice key <id>   (reads the key from stdin)\n  voice <provider> [off]\n  in gray: /voice status|stt|test|on|off|<provider> [off]\n  tools: voice_say voice_listen"),
+        Some("-h") | Some("--help") | Some("help") => println!(
+            "voice — TTS/STT.\n  voice status|stt|test|dictate [secs]|on|off\n  voice key <id>   (reads the key from stdin)\n  voice <provider> [off]\n  in gray: /voice status|stt|test|on|off|<provider> [off]\n  tools: voice_say voice_listen"
+        ),
         _ => {
             if args.is_empty() {
                 if std::io::stdin().is_terminal() {
-                    println!("{}", status(&Shared {
-                        enabled: AtomicBool::new(false),
-                        pump_q: Mutex::new(VecDeque::new()), cv: Condvar::new(),
-                        heard: Mutex::new(VecDeque::new()),
-                        inflight: Mutex::new(HashMap::new()),
-                        denied: AtomicBool::new(false), seq: AtomicU64::new(0),
-                        listener_started: AtomicBool::new(false) }));
+                    println!(
+                        "{}",
+                        status(&Shared {
+                            enabled: AtomicBool::new(false),
+                            pump_q: Mutex::new(VecDeque::new()),
+                            cv: Condvar::new(),
+                            heard: Mutex::new(VecDeque::new()),
+                            inflight: Mutex::new(HashMap::new()),
+                            denied: AtomicBool::new(false),
+                            seq: AtomicU64::new(0),
+                            listener_started: AtomicBool::new(false)
+                        })
+                    );
                     return;
                 }
-                let _ = sidecar(); return;
+                let _ = sidecar();
+                return;
             }
-            eprintln!("unknown verb"); std::process::exit(1);
+            eprintln!("unknown verb");
+            std::process::exit(1);
         }
     }
 }
