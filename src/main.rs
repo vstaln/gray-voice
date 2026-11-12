@@ -417,22 +417,39 @@ fn key_state(p: &Stt) -> &'static str {
     }
 }
 
-fn stt_picker(selected: Option<&str>) -> Value {
-    let items: Vec<Value> = STT
-        .iter()
-        .map(|p| {
-            json!({
-                "id": p.id,
-                "label": format!("{} {}", if stt_enabled(p) { "on " } else { "off" }, p.label),
-                "description": format!("{} · {}", key_state(p), p.free),
-            })
+fn voice_picker(sh: &Shared, selected: Option<&str>) -> Value {
+    let listening = sh.enabled.load(Ordering::Relaxed);
+    let mut items = vec![
+        json!({
+            "id": "listen",
+            "label": format!("hands-free listening   {}", if listening { "on" } else { "off" }),
+            "description": "hears you all the time, sends when you pause",
+        }),
+        json!({
+            "id": "test",
+            "label": "test the microphone",
+            "description": "records 4 s after Enter, then prints the text",
+        }),
+    ];
+    items.extend(STT.iter().map(|p| {
+        json!({
+            "id": p.id,
+            "label": format!("{} {}", if stt_enabled(p) { "●" } else { "○" }, p.label),
+            "description": format!("{} · {}", key_state(p), p.free),
         })
-        .collect();
+    }));
+    let mic = pick(&["arecord", "sox"]).unwrap_or("none".into());
+    let speaker =
+        pick(&["say", "espeak-ng", "espeak", "piper", "spd-say"]).unwrap_or("none".into());
     json!({
-        "title": "voice · speech to text",
+        "title": "voice",
         "items": items,
         "selected_id": selected,
-        "footer": "ctrl+space or F8 dictates · Enter turns a provider on or off · Esc closes",
+        "footer": format!(
+            "dictate with ctrl+space or F8 · mic {mic} · speaker {speaker}\n\
+             ● providers are tried top to bottom · set a key with: gray voice key <id>\n\
+             Enter toggles or runs · Esc closes"
+        ),
     })
 }
 
@@ -675,13 +692,45 @@ fn status(sh: &Shared) -> String {
     )
 }
 
+fn set_listen(sh: &Arc<Shared>, on: bool) -> String {
+    if !on {
+        sh.enabled.store(false, Ordering::Relaxed);
+        return match persist_enabled(false) {
+            Ok(()) => "listening off".into(),
+            Err(e) => format!("listening off (config not saved: {e})"),
+        };
+    }
+    let missing = missing_listen_deps();
+    if !missing.is_empty() {
+        return format!("cannot listen, missing: {}", missing.join(", "));
+    }
+    sh.enabled.store(true, Ordering::Relaxed);
+    if !sh.listener_started.swap(true, Ordering::Relaxed) {
+        let sh2 = Arc::clone(sh);
+        std::thread::spawn(move || listener(sh2));
+    }
+    match persist_enabled(true) {
+        Ok(()) => "listening on".to_string(),
+        Err(e) => format!("listening on (config not saved: {e})"),
+    }
+}
+
 fn command_run(sh: &Arc<Shared>, params: &Value) -> Value {
     let argv: Vec<&str> = params["argv"]
         .as_array()
         .map(|a| a.iter().filter_map(Value::as_str).collect())
         .unwrap_or_default();
     match argv.as_slice() {
-        [] => return json!({"result": {"picker": stt_picker(None)}}),
+        [] => return json!({"result": {"picker": voice_picker(sh, None)}}),
+        ["--pick", "listen"] => {
+            let on = !sh.enabled.load(Ordering::Relaxed);
+            let text = set_listen(sh, on);
+            if sh.enabled.load(Ordering::Relaxed) != on {
+                return json!({"result": {"text": text}});
+            }
+            return json!({"result": {"picker": voice_picker(sh, Some("listen"))}});
+        }
+        ["--pick", "test"] => return json!({"result": {"text": voice_test()}}),
         ["--pick", id] => {
             let Some(p) = STT.iter().find(|p| p.id == *id) else {
                 return json!({"result": {"text": format!("unknown provider {id}")}});
@@ -689,35 +738,14 @@ fn command_run(sh: &Arc<Shared>, params: &Value) -> Value {
             if let Err(e) = stt_toggle(p, !stt_enabled(p)) {
                 return json!({"result": {"text": format!("{id}: config not saved: {e}")}});
             }
-            return json!({"result": {"picker": stt_picker(Some(id))}});
+            return json!({"result": {"picker": voice_picker(sh, Some(id))}});
         }
         _ => {}
     }
     let verb = argv[0];
     let text = match verb {
-        "on" => {
-            let missing = missing_listen_deps();
-            if !missing.is_empty() {
-                format!("cannot listen — missing: {}", missing.join(", "))
-            } else {
-                sh.enabled.store(true, Ordering::Relaxed);
-                if !sh.listener_started.swap(true, Ordering::Relaxed) {
-                    let sh2 = Arc::clone(sh);
-                    std::thread::spawn(move || listener(sh2));
-                }
-                match persist_enabled(true) {
-                    Ok(()) => "listening on".to_string(),
-                    Err(e) => format!("listening on (config not saved: {e})"),
-                }
-            }
-        }
-        "off" => {
-            sh.enabled.store(false, Ordering::Relaxed);
-            match persist_enabled(false) {
-                Ok(()) => "listening off".into(),
-                Err(e) => format!("listening off (config not saved: {e})"),
-            }
-        }
+        "on" => set_listen(sh, true),
+        "off" => set_listen(sh, false),
         "status" => format!("{}\n\n{}", status(sh), stt_panel()),
         "stt" | "panel" => {
             if params["argv"]
