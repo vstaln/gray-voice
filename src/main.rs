@@ -137,7 +137,8 @@ fn record(out: &std::path::Path, secs: &str) -> bool {
 /// Record until gray reports the hotkey pressed again (or released, in
 /// hold mode) on stdin as `down`/`up` lines, showing a level meter on
 /// stderr, which gray displays as the status line.
-fn record_live(out: &std::path::Path, hold: bool, key: &str) -> Result<usize, String> {
+fn record_live(out: &std::path::Path, hold: bool, key: &str) -> Result<String, String> {
+    let live = std::env::var_os("GRAY_ACTION_INSERT").is_some();
     use std::io::BufRead;
     use std::time::{Duration, Instant};
     let mut cmd = if have("pw-record") {
@@ -179,7 +180,7 @@ fn record_live(out: &std::path::Path, hold: bool, key: &str) -> Result<usize, St
     let gate = voice_gate();
     let (seg_tx, seg_rx) = std::sync::mpsc::channel::<Vec<u8>>();
     let worker = std::thread::spawn(move || {
-        let mut sent = 0usize;
+        let mut all = String::new();
         let mut last_err = String::from("too quiet");
         for (n, pcm) in seg_rx.into_iter().enumerate() {
             let wav =
@@ -195,17 +196,20 @@ fn record_live(out: &std::path::Path, hold: bool, key: &str) -> Result<usize, St
             let _ = std::fs::remove_file(&wav);
             match t {
                 Ok(t) => {
-                    let sep = if sent == 0 { "" } else { " " };
-                    eprintln!("insert\t{sep}{}", t.replace(['\n', '\t'], " "));
-                    sent += 1;
+                    let sep = if all.is_empty() { "" } else { " " };
+                    let piece = format!("{sep}{}", t.replace(['\n', '\t'], " "));
+                    if live {
+                        eprintln!("insert\t{piece}");
+                    }
+                    all.push_str(&piece);
                 }
                 Err(e) => last_err = e,
             }
         }
-        if sent == 0 {
+        if all.is_empty() {
             Err(last_err)
         } else {
-            Ok(sent)
+            Ok(all)
         }
     });
     let start = Instant::now();
@@ -1464,9 +1468,13 @@ fn main() {
             let Some(n) = secs else {
                 let r = record_live(&wav, hold_to_talk(), &key_label(&hotkey()));
                 let _ = std::fs::remove_file(&wav);
-                if let Err(e) = r {
-                    eprintln!("no speech detected \u{2014} {e}");
-                    std::process::exit(1);
+                match r {
+                    Ok(t) if std::env::var_os("GRAY_ACTION_INSERT").is_none() => println!("{t}"),
+                    Ok(_) => {}
+                    Err(e) => {
+                        eprintln!("no speech detected \u{2014} {e}");
+                        std::process::exit(1);
+                    }
                 }
                 return;
             };
