@@ -1,7 +1,7 @@
 //! voice — local speech tools and an ambient voice channel.
 //!
 //! Tools: voice_say (TTS via say/espeak-ng/espeak/piper/spd-say) and
-//! voice_listen (whisper.cpp over a mic recording via arecord/sox).
+//! voice_listen (whisper.cpp over a mic recording via pw-record/arecord/sox).
 //! Ambient mode (`/voice on` or VOICE_LISTEN=1): a background listener
 //! turns mic chunks into transcripts pushed via `host/run` (capability
 //! `host.turn`), with `prompt/context` as the pull fallback. Everything
@@ -32,7 +32,7 @@ fn manifest() -> Value {
                 "rate": {"type": "integer", "description": "words per minute where supported"}},
              "required": ["text"]}},
             {"name": "voice_listen",
-             "description": "Record N seconds from the mic and transcribe with the first working STT provider (whisper.cpp, groq, xai, cf). Needs a recorder (arecord|sox). Ambient mode: /voice on|off.",
+             "description": "Record N seconds from the mic and transcribe with the first working STT provider (whisper.cpp, groq, xai, cf). Needs a recorder (pw-record|arecord|sox). Ambient mode: /voice on|off.",
              "parameters": {"type": "object", "properties": {
                 "seconds": {"type": "integer"},
                 "model": {"type": "string", "description": "whisper .bin model path"}},
@@ -79,23 +79,47 @@ fn pick(cands: &[&str]) -> Option<String> {
 
 // ── ambient listener ──────────────────────────────────────────
 
+fn have_recorder() -> bool {
+    ["pw-record", "arecord", "sox"].iter().any(|r| have(r))
+}
+
+/// Records `secs` seconds of 16 kHz mono WAV. PipeWire first: on systems
+/// without the ALSA bridge, arecord can't open the default device.
 fn record(out: &std::path::Path, secs: &str) -> bool {
-    if have("arecord") {
-        Command::new("arecord")
-            .args(["-q", "-f", "S16_LE", "-r", "16000", "-c", "1", "-d", secs])
+    let ok = |c: &mut Command| c.status().map(|s| s.success()).unwrap_or(false);
+    // `timeout -s INT` stops pw-record cleanly and exits 124, so judge by the file.
+    if have("pw-record") && have("timeout") {
+        let _ = Command::new("timeout")
+            .args([
+                "-s",
+                "INT",
+                secs,
+                "pw-record",
+                "--rate",
+                "16000",
+                "--channels",
+                "1",
+            ])
+            .args(["--format", "s16"])
             .arg(out)
-            .status()
-    } else if have("sox") {
-        Command::new("sox")
+            .stdout(std::process::Stdio::null())
+            .status();
+        if std::fs::metadata(out).is_ok_and(|m| m.len() > 44) {
+            return true;
+        }
+    }
+    if have("arecord")
+        && ok(Command::new("arecord")
+            .args(["-q", "-f", "S16_LE", "-r", "16000", "-c", "1", "-d", secs])
+            .arg(out))
+    {
+        return true;
+    }
+    have("sox")
+        && ok(Command::new("sox")
             .args(["-d", "-r", "16000", "-c", "1", "-b", "16"])
             .arg(out)
-            .args(["trim", "0", secs])
-            .status()
-    } else {
-        return false;
-    }
-    .map(|s| s.success())
-    .unwrap_or(false)
+            .args(["trim", "0", secs]))
 }
 
 /// Mean |i16| over WAV data; below VOICE_RMS (default 150) the chunk is
@@ -140,8 +164,8 @@ fn transcribe(whisper: &str, wav: &std::path::Path, model: Option<&str>) -> Opti
 }
 
 fn listener(sh: Arc<Shared>) {
-    if !have("arecord") && !have("sox") {
-        eprintln!("voice: no recorder (arecord/sox) — listener idle");
+    if !have_recorder() {
+        eprintln!("voice: no recorder (pw-record/arecord/sox) — listener idle");
         return;
     }
     if !stt_ready() {
@@ -239,13 +263,16 @@ fn voice_say(a: &Value) -> Result<String, String> {
 
 fn voice_listen(a: &Value) -> Result<String, String> {
     let secs = a["seconds"].as_u64().unwrap_or(5).clamp(1, 60).to_string();
-    if !have("arecord") && !have("sox") {
-        return Err("no recorder — install alsa-utils (arecord) or sox".into());
+    if !have_recorder() {
+        return Err(
+            "no recorder — install pipewire (pw-record), alsa-utils (arecord) or sox".into(),
+        );
     }
     let wav = std::env::temp_dir().join(format!("voice-{}.wav", std::process::id()));
     if !record(&wav, &secs) {
         return Err(
-            "recording failed — no working mic device? (arecord/sox exited nonzero)".into(),
+            "recording failed — no working mic device? (pw-record/arecord/sox exited nonzero)"
+                .into(),
         );
     }
     let model = a["model"]
@@ -504,12 +531,13 @@ fn voice_picker(selected: Option<&str>) -> Value {
             })
         })
         .collect();
+    items.insert(0, json!({"id": "dictate", "label": "\u{25b6} Dictate now", "description": "ctrl+space or F8 from the prompt"}));
     items.push(json!({"id": "add", "label": "+ Add your own", "description": "any OpenAI-compatible endpoint"}));
     json!({
         "title": "Speech to text",
         "items": items,
         "selected_id": selected,
-        "footer": "Enter turns on or off · ctrl+space or F8 dictates",
+        "footer": "Enter on a provider turns it on or off",
     })
 }
 
@@ -674,8 +702,8 @@ fn stt_transcribe(wav: &std::path::Path) -> Result<String, String> {
 }
 
 fn voice_test() -> String {
-    if !have("arecord") && !have("sox") {
-        return "no recorder (arecord/sox)".into();
+    if !have_recorder() {
+        return "no recorder (pw-record/arecord/sox)".into();
     }
     let wav = std::env::temp_dir().join(format!("voice-test-{}.wav", std::process::id()));
     if !record(&wav, "4") {
@@ -723,8 +751,8 @@ fn missing_listen_deps() -> Vec<&'static str> {
     if !stt_ready() {
         m.push("speech-to-text (whisper.cpp or /voice <id> on)");
     }
-    if !have("arecord") && !have("sox") {
-        m.push("recorder (arecord/sox)");
+    if !have_recorder() {
+        m.push("recorder (pw-record/arecord/sox)");
     }
     m
 }
@@ -732,7 +760,7 @@ fn missing_listen_deps() -> Vec<&'static str> {
 fn status(sh: &Shared) -> String {
     let tts = pick(&["say", "espeak-ng", "espeak", "piper", "spd-say"]).unwrap_or("none".into());
     let stt = pick(&["whisper-cli", "whisper", "main", "whisper-cpp"]).unwrap_or("none".into());
-    let rec = pick(&["arecord", "sox"]).unwrap_or("none".into());
+    let rec = pick(&["pw-record", "arecord", "sox"]).unwrap_or("none".into());
     let model = std::env::var("VOICE_MODEL")
         .or_else(|_| std::env::var("WHISPER_MODEL"))
         .unwrap_or("(whisper default)".into());
@@ -782,6 +810,9 @@ fn command_run(sh: &Arc<Shared>, params: &Value) -> Value {
         .unwrap_or_default();
     match argv.as_slice() {
         [] => return json!({"result": {"picker": voice_picker(None)}}),
+        ["--pick", "dictate"] => {
+            return json!({"result": {"composer_action": "f8", "text": "dictation needs the gray prompt: press ctrl+space or F8"}});
+        }
         ["--pick", "add"] | ["add"] => return json!({"result": {"text": add_custom(&["add"])}}),
         ["add", ..] => return json!({"result": {"text": add_custom(&argv)}}),
         ["remove", id] => return json!({"result": {"text": remove_custom(id)}}),
@@ -994,8 +1025,8 @@ fn main() {
             println!("listening off (persisted)");
         }
         Some("dictate") => {
-            if !have("arecord") && !have("sox") {
-                eprintln!("no recorder (arecord/sox)");
+            if !have_recorder() {
+                eprintln!("no recorder (pw-record/arecord/sox)");
                 std::process::exit(1);
             }
             let secs = args
@@ -1010,7 +1041,11 @@ fn main() {
                 eprintln!("recording failed");
                 std::process::exit(1);
             }
-            let t = stt_transcribe(&wav);
+            let t = if loud(&wav) {
+                stt_transcribe(&wav)
+            } else {
+                Err("too quiet".into())
+            };
             let _ = std::fs::remove_file(&wav);
             match t {
                 Ok(t) => println!("{t}"),
