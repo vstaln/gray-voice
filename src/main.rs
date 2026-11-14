@@ -5,7 +5,7 @@
 
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
-use std::io::{BufRead, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -19,7 +19,7 @@ mod speech;
 const NAME: &str = "voice";
 const DEFAULT_HOTKEY: &str = "ctrl+space";
 const HOTKEY_ID: &str = "plugin.voice.dictate";
-const NO_RECORDER: &str = "No recorder \u{b7} install pipewire or alsa-utils";
+static CONFIG_SEQ: AtomicU64 = AtomicU64::new(0);
 const MODEL_MISSING: &str = "No whisper model \u{b7} enter to download";
 const MODEL_FILE: &str = "ggml-base.en.bin";
 const MODEL_URL: &str =
@@ -43,7 +43,7 @@ fn manifest() -> Value {
              "description": "Speak text aloud with the voice chosen in /voice.",
              "parameters": {"type": "object", "properties": {
                 "text": {"type": "string"},
-                "engine": {"type": "string", "description": "pin a voice: say|piper|espeak-ng|espeak|spd-say|deepgram|fish"},
+                "engine": {"type": "string", "description": "pin a voice: say|windows|piper|espeak-ng|espeak|spd-say|deepgram|fish"},
                 "rate": {"type": "integer", "description": "words per minute where supported"}},
              "required": ["text"]}},
             {"name": "voice_listen", "label": "Listened", "preview": "{seconds}s",
@@ -53,6 +53,7 @@ fn manifest() -> Value {
              }},
         ],
         "commands": ["/voice"], "subcommands": ["voice"],
+        "completion": ["setup", "status", "key", "test", "dictate", "say", "on", "off", "page"],
         "command_descriptions": {"/voice": "speech in and out"},
         "composer_actions": [
             {"id": "dictate", "keys": [DEFAULT_HOTKEY], "argv": ["dictate"], "busy": "\u{25cf} 0:00"},
@@ -160,45 +161,67 @@ fn read_config() -> Value {
         .unwrap_or_else(|| json!({}))
 }
 
-fn update_config(f: impl FnOnce(&mut Value)) -> Result<(), String> {
-    let cfg = config_path();
-    if let Some(p) = cfg.parent() {
-        std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+fn rename_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    let mut last = None;
+    for attempt in 0..6 {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = Some(e),
+        }
+        std::thread::sleep(Duration::from_millis(20 << attempt));
     }
-    // One handle for the lock, the read and the write. The advisory lock is
-    // exclusive, and on Windows it blocks reads through any *other* handle to
-    // the same file: opening the path again to read (read_config) returned
-    // nothing and opening it again to truncate left the file empty, so every
-    // save silently wiped the settings it meant to keep.
+    Err(last.unwrap_or_else(|| std::io::Error::other("rename failed")))
+}
+
+fn write_private(path: &Path, data: &str) -> std::io::Result<()> {
     let mut o = std::fs::OpenOptions::new();
-    o.read(true).write(true).create(true).truncate(false);
+    o.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         o.mode(0o600);
     }
-    let mut file = o.open(&cfg).map_err(|e| e.to_string())?;
+    let mut f = o.open(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
     }
-    file.lock().map_err(|e| e.to_string())?;
-    let r = (|| -> std::io::Result<()> {
-        let mut raw = String::new();
-        file.read_to_string(&mut raw)?;
-        let mut c: Value = serde_json::from_str(&raw).unwrap_or_else(|_| json!({}));
-        if !c.is_object() {
-            c = json!({});
-        }
-        f(&mut c);
-        let data = serde_json::to_string_pretty(&c).map_err(std::io::Error::other)?;
-        file.set_len(0)?;
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(data.as_bytes())
-    })();
-    let _ = file.unlock();
-    r.map_err(|e| e.to_string())
+    f.write_all(data.as_bytes())?;
+    f.sync_all()
+}
+
+fn config_note(e: &dyn std::fmt::Display) -> String {
+    format!("could not save voice settings ({e}) \u{b7} change them in /voice inside gray")
+}
+
+fn update_config(f: impl FnOnce(&mut Value)) -> Result<(), String> {
+    let cfg = config_path();
+    let dir = cfg
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    std::fs::create_dir_all(&dir).map_err(|e| config_note(&e))?;
+    let mut c = read_config();
+    if !c.is_object() {
+        c = json!({});
+    }
+    f(&mut c);
+    let data = serde_json::to_string_pretty(&c).unwrap_or_default();
+    let tmp = dir.join(format!(
+        ".config.json.{}.{}.tmp",
+        std::process::id(),
+        CONFIG_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    if let Err(e) = write_private(&tmp, &data) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(config_note(&e));
+    }
+    if let Err(e) = rename_retry(&tmp, &cfg) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(config_note(&e));
+    }
+    Ok(())
 }
 
 fn read_json(path: PathBuf) -> Value {
@@ -384,26 +407,135 @@ fn loud(path: &Path) -> bool {
     n > 0 && (sum as f64 / n as f64) > gate
 }
 
+fn recorder_program() -> Option<&'static str> {
+    let program = ["pw-record", "arecord", "sox"]
+        .iter()
+        .find(|r| in_path(r))
+        .copied();
+    if program.is_some() {
+        return program;
+    }
+    #[cfg(windows)]
+    if in_path("ffmpeg") {
+        return Some("ffmpeg");
+    }
+    None
+}
+
+#[cfg(windows)]
+fn dshow_devices() -> Vec<String> {
+    let Ok(out) = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-list_devices",
+            "true",
+            "-f",
+            "dshow",
+            "-i",
+            "dummy",
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+    else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stderr).into_owned();
+    text.lines()
+        .filter(|l| l.contains("(audio)"))
+        .filter_map(|l| {
+            let rest = &l[l.find('"')? + 1..];
+            Some(rest[..rest.rfind('"')?].to_string())
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn mic_device() -> Option<String> {
+    if let Some(d) = read_config()["mic_device"]
+        .as_str()
+        .filter(|d| !d.trim().is_empty())
+    {
+        return Some(d.to_string());
+    }
+    let device = dshow_devices().into_iter().next()?;
+    let _ = update_config(|c| c["mic_device"] = json!(device));
+    Some(device)
+}
+
 fn recorder_cmd() -> Option<Command> {
-    if in_path("pw-record") {
-        let mut c = Command::new("pw-record");
-        c.args(["--rate", "16000", "--channels", "1", "--format", "s16"]);
-        Some(c)
-    } else if in_path("arecord") {
-        let mut c = Command::new("arecord");
-        c.args(["-q", "-f", "S16_LE", "-r", "16000", "-c", "1"]);
-        Some(c)
-    } else if in_path("sox") {
-        let mut c = Command::new("sox");
-        c.args(["-q", "-d", "-r", "16000", "-c", "1", "-b", "16"]);
-        Some(c)
-    } else {
-        None
+    match recorder_program()? {
+        "pw-record" => {
+            let mut c = Command::new("pw-record");
+            c.args(["--rate", "16000", "--channels", "1", "--format", "s16"]);
+            Some(c)
+        }
+        "arecord" => {
+            let mut c = Command::new("arecord");
+            c.args(["-q", "-f", "S16_LE", "-r", "16000", "-c", "1"]);
+            Some(c)
+        }
+        "sox" => {
+            let mut c = Command::new("sox");
+            c.args(["-q", "-d", "-r", "16000", "-c", "1", "-b", "16"]);
+            Some(c)
+        }
+        #[cfg(windows)]
+        "ffmpeg" => {
+            let dev = mic_device()?;
+            let mut c = Command::new("ffmpeg");
+            c.args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "dshow",
+                "-i",
+                &format!("audio=\"{dev}\""),
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-f",
+                "wav",
+            ]);
+            Some(c)
+        }
+        _ => None,
     }
 }
 
 fn have_recorder() -> bool {
-    ["pw-record", "arecord", "sox"].iter().any(|r| in_path(r))
+    recorder_program().is_some()
+}
+
+fn no_recorder_line() -> String {
+    if cfg!(windows) {
+        "none \u{b7} install ffmpeg (winget install Gyan.FFmpeg) so the mic can be recorded".into()
+    } else {
+        "none \u{b7} install pipewire or alsa-utils".into()
+    }
+}
+
+fn recorder_label() -> Option<String> {
+    let program = recorder_program()?;
+    #[cfg(windows)]
+    if program == "ffmpeg" {
+        return Some(match mic_device() {
+            Some(d) => format!("ffmpeg dshow \u{b7} {d}"),
+            None => "ffmpeg dshow \u{b7} no input device".to_string(),
+        });
+    }
+    Some(program.to_string())
+}
+
+fn no_speaker_line() -> String {
+    if cfg!(windows) {
+        "none \u{b7} PowerShell with System.Speech was not found".into()
+    } else {
+        "none \u{b7} install espeak-ng".into()
+    }
 }
 
 struct Capture {
@@ -418,7 +550,7 @@ struct Capture {
 impl Capture {
     fn start(path: PathBuf) -> Result<Self, String> {
         let _ = std::fs::remove_file(&path);
-        let mut cmd = recorder_cmd().ok_or(NO_RECORDER)?;
+        let mut cmd = recorder_cmd().ok_or_else(no_recorder_line)?;
         let rec = bound(
             cmd.arg(&path)
                 .stdin(Stdio::null())
@@ -600,7 +732,7 @@ fn stt_problem() -> Option<String> {
 
 fn ambient_problem() -> Option<String> {
     if !have_recorder() {
-        return Some(NO_RECORDER.into());
+        return Some(no_recorder_line());
     }
     stt_problem()
 }
@@ -755,7 +887,7 @@ enum TestEvent {
 
 fn test_mic(mut on: impl FnMut(TestEvent)) -> Result<Option<String>, String> {
     if !have_recorder() {
-        return Err(NO_RECORDER.into());
+        return Err(no_recorder_line());
     }
     if let Some(p) = stt_problem() {
         return Err(p);
@@ -1002,7 +1134,7 @@ fn voice_say(a: &Value) -> Result<String, String> {
 fn voice_listen(a: &Value) -> Result<String, String> {
     let secs = a["seconds"].as_u64().unwrap_or(5).clamp(1, 60);
     if !have_recorder() {
-        return Err(NO_RECORDER.into());
+        return Err(no_recorder_line());
     }
     if let Some(p) = stt_problem() {
         return Err(p);
@@ -1040,6 +1172,209 @@ fn key_label(key: &str) -> String {
         .join("+")
 }
 
+fn provider_label(id: &str) -> String {
+    STT_NAMES
+        .iter()
+        .find(|(n, _)| *n == id)
+        .map(|(_, l)| (*l).to_string())
+        .unwrap_or_else(|| id.to_string())
+}
+
+fn keys_state() -> String {
+    ["groq", "deepgram", "fish"]
+        .iter()
+        .map(|id| {
+            format!(
+                "{id} {}",
+                if provider_key(id).is_some() {
+                    "\u{2713}"
+                } else {
+                    "\u{2717}"
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" \u{b7} ")
+}
+
+fn whisper_state() -> String {
+    match (whisper_bin(), whisper_model()) {
+        (Some(bin), Some(model)) => {
+            let name = Path::new(&model)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or(model);
+            format!("{name} \u{b7} {bin}")
+        }
+        (None, _) => "whisper.cpp not installed".into(),
+        (Some(bin), None) => format!("{bin} \u{b7} no model yet (downloads on first dictation)"),
+    }
+}
+
+fn speaker_line() -> String {
+    match speech::tts_active().as_str() {
+        "deepgram" => "Deepgram Aura".into(),
+        "fish" => "Fish Audio".into(),
+        _ => match speech::local_engine() {
+            Some(e) if e == "windows" => "Windows voice (System.Speech)".into(),
+            Some(e) => e,
+            None => no_speaker_line(),
+        },
+    }
+}
+
+fn status_text(verbose: bool) -> String {
+    let id = stt_active();
+    let stt = match stt_problem() {
+        None => format!(
+            "{} ({})",
+            provider_label(&id),
+            if id == "local" { "ready" } else { "key saved" }
+        ),
+        Some(p) => format!("{} \u{b7} {p}", provider_label(&id)),
+    };
+    let mic = recorder_label().unwrap_or_else(no_recorder_line);
+    let mut out = vec![
+        format!("speech-to-text  {stt}"),
+        format!("speaker         {}", speaker_line()),
+        format!("microphone      {mic}"),
+    ];
+    if verbose {
+        out.push(format!(
+            "dictate key     {} \u{b7} {}",
+            key_label(&hotkey()),
+            if hold_to_talk() {
+                "hold to talk"
+            } else {
+                "toggle"
+            }
+        ));
+        out.push(format!(
+            "ambient listen  {}",
+            if read_config()["listen"].as_bool().unwrap_or(false) {
+                "on"
+            } else {
+                "off"
+            }
+        ));
+        out.push(format!(
+            "read answers    {}",
+            if speech::read_answers() { "on" } else { "off" }
+        ));
+        out.push(format!("whisper         {}", whisper_state()));
+        out.push(format!("keys            {}", keys_state()));
+        out.push(format!("config          {}", config_path().display()));
+    }
+    out.join("\n")
+}
+
+fn pick_stt() -> Option<&'static str> {
+    if provider_key("groq").is_some() {
+        return Some("groq");
+    }
+    if provider_key("deepgram").is_some() {
+        return Some("deepgram");
+    }
+    if whisper_bin().is_some() {
+        return Some("local");
+    }
+    None
+}
+
+fn setup_text() -> String {
+    migrate();
+    let picked = pick_stt();
+    let saved = update_config(|c| {
+        if c["stt"].is_null() {
+            if let Some(id) = picked {
+                c["stt"] = json!(id);
+            }
+        }
+        if c["tts"].is_null() {
+            c["tts"] = json!("local");
+        }
+        if c["read_answers"].is_null() {
+            c["read_answers"] = json!(false);
+        }
+    });
+    let ready = stt_problem().is_none() && have_recorder() && speech::local_engine().is_some();
+    let mut out = vec![
+        if ready {
+            "\u{2713} Voice ready".to_string()
+        } else {
+            "\u{2717} Voice is not ready on this machine yet".to_string()
+        },
+        status_text(false),
+    ];
+    if let Err(e) = saved {
+        out.push(format!("\u{2717} {e}"));
+    }
+    if stt_problem().is_some() {
+        out.push(format!(
+            "fix  paste a key: echo KEY | gray voice key groq{}",
+            if whisper_bin().is_none() || whisper_model().is_none() {
+                " (or run /voice and pick whisper.cpp)"
+            } else {
+                ""
+            }
+        ));
+    }
+    if !have_recorder() {
+        out.push(format!("fix  {}", no_recorder_line()));
+    }
+    if speech::local_engine().is_none() && speech::tts_active() == "local" {
+        out.push(format!("fix  {}", no_speaker_line()));
+    }
+    out.push("check it  gray voice test".to_string());
+    out.join("\n")
+}
+
+fn save_key(id: &str, key: &str) -> Result<String, String> {
+    let id = id.trim().to_lowercase();
+    if !STT_NAMES.iter().any(|(n, _)| *n == id) && id != "fish" {
+        return Err(format!(
+            "unknown provider {id} \u{b7} use groq, deepgram, fish or local"
+        ));
+    }
+    if key.trim().is_empty() {
+        return Err("empty key \u{b7} echo KEY | gray voice key groq".into());
+    }
+    let select = read_config()["stt"].is_null() && id != "local" && id != "fish";
+    update_config(|c| {
+        c["keys"][&id] = json!(key.trim());
+        if select {
+            c["stt"] = json!(id);
+        }
+    })?;
+    let label = if id == "fish" {
+        "Fish Audio".to_string()
+    } else {
+        provider_label(&id)
+    };
+    Ok(if select {
+        format!("\u{2713} {label} key saved \u{b7} speech-to-text: {label}")
+    } else {
+        format!("\u{2713} {label} key saved")
+    })
+}
+
+fn usage() -> String {
+    [
+        "voice \u{2014} speech in and out for gray",
+        "",
+        "start here   gray voice setup",
+        "with a key   echo KEY | gray voice key groq",
+        "",
+        "gray voice status [--verbose]   what is set up and what is missing",
+        "gray voice test                 record 3s and transcribe it",
+        "gray voice dictate [secs]       type what you say into the prompt",
+        "gray voice say TEXT             speak it",
+        "gray voice on | off             ambient listening",
+        "gray voice                      the /voice screen",
+    ]
+    .join("\n")
+}
+
 fn test_line() -> String {
     match test_mic(|_| {}) {
         Ok(Some(t)) => format!("\u{2713} Ready \u{b7} \u{201c}{t}\u{201d}"),
@@ -1068,7 +1403,14 @@ fn command_run(sh: &Arc<Shared>, params: &Value) -> Value {
             Err(e) => format!("\u{2717} {e}"),
         },
         ["test"] => test_line(),
-        _ => "/voice [on|off|say TEXT|test]".to_string(),
+        ["status"] => status_text(false),
+        ["status", "--verbose"] | ["status", "-v"] => status_text(true),
+        ["setup"] => setup_text(),
+        ["key", id] => match save_key(id, "") {
+            Ok(t) => t,
+            Err(e) => format!("\u{2717} {e} \u{b7} paste the key in /voice"),
+        },
+        _ => "/voice [setup|status [--verbose]|on|off|test|say TEXT]".to_string(),
     };
     json!({"result": {"text": text}})
 }
@@ -1198,6 +1540,29 @@ fn main() {
             migrate();
             println!("{}", test_line());
         }
+        Some("status") => {
+            migrate();
+            println!(
+                "{}",
+                status_text(args.iter().any(|a| a == "--verbose" || a == "-v"))
+            );
+        }
+        Some("setup") => println!("{}", setup_text()),
+        Some("key") => {
+            migrate();
+            let Some(id) = args.get(1) else {
+                fail("usage: echo KEY | gray voice key groq");
+            };
+            let mut key = String::new();
+            if std::io::stdin().read_to_string(&mut key).is_err() {
+                fail("could not read the key from stdin");
+            }
+            match save_key(id, &key) {
+                Ok(t) => println!("{t}"),
+                Err(e) => fail(&e),
+            }
+        }
+        Some("help" | "-h" | "--help") => println!("{}", usage()),
         Some("on") | Some("off") => {
             migrate();
             let on = args[0] == "on";
@@ -1238,7 +1603,7 @@ fn main() {
                 let _ = sidecar();
                 return;
             }
-            fail("voice page|on|off|say TEXT|test");
+            fail(&usage());
         }
     }
 }

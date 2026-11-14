@@ -47,10 +47,18 @@ pub fn piper_model() -> Option<String> {
 }
 
 pub fn local_engine() -> Option<String> {
-    ["say", "piper", "espeak-ng", "espeak", "spd-say"]
+    let found = ["say", "piper", "espeak-ng", "espeak", "spd-say"]
         .iter()
         .find(|e| (**e != "piper" || piper_model().is_some()) && have(e))
-        .map(|s| s.to_string())
+        .map(|s| s.to_string());
+    if found.is_some() {
+        return found;
+    }
+    #[cfg(windows)]
+    if crate::in_path("powershell") {
+        return Some("windows".to_string());
+    }
+    None
 }
 
 pub fn tts_active() -> String {
@@ -274,6 +282,23 @@ pub fn say(text: &str, engine: Option<&str>, rate: Option<u64>) -> Result<String
                     play_wav(&local_wav(&e, &c, &rate)?, &flag)?;
                 }
             }
+            "windows" => {
+                let sapi = ((rate.parse::<i64>().unwrap_or(180) - 180) / 20).clamp(-10, 10);
+                let script = format!(
+                    "Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Rate = {sapi}; $s.Speak([Console]::In.ReadToEnd())"
+                );
+                for c in chunks(text, 4000) {
+                    let mut cmd = Command::new("powershell");
+                    cmd.args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                        .stdin(Stdio::piped());
+                    let mut child =
+                        crate::bound(&mut cmd).map_err(|er| format!("windows voice: {er}"))?;
+                    if let Some(mut si) = child.stdin.take() {
+                        let _ = si.write_all(c.as_bytes());
+                    }
+                    run_with_meter(child, &[], &flag)?;
+                }
+            }
             other => return Err(format!("Unknown voice {other}")),
         }
         return Ok(e);
@@ -409,5 +434,9 @@ pub fn prose(text: &str) -> String {
 }
 
 pub fn local_label() -> String {
-    local_engine().unwrap_or_else(|| "piper".into())
+    match local_engine().as_deref() {
+        Some("windows") => "Windows voice".into(),
+        Some(e) => e.to_string(),
+        None => "piper".into(),
+    }
 }

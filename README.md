@@ -27,8 +27,22 @@ crashes.
 
 | Tool | What it does |
 |---|---|
-| `voice_say` | Speak text through the first available of `say` (macOS), `spd-say`, `espeak-ng`, `espeak`, `piper`. |
-| `voice_listen` | Transcribe a mic recording via `whisper.cpp` (`whisper-cli`) over `arecord`/`sox` capture. |
+| `voice_say` | Speak text through the first available of `say` (macOS), Windows `System.Speech`, `spd-say`, `espeak-ng`, `espeak`, `piper`. |
+| `voice_listen` | Transcribe a mic recording via `whisper.cpp` (`whisper-cli`) over `pw-record`/`arecord`/`sox`, or `ffmpeg` + dshow on Windows. |
+
+## Setup
+
+```bash
+gray voice setup                            # detect what this machine has, pick the defaults
+echo "$GROQ_API_KEY" | gray voice key groq  # save a key; it becomes the speech-to-text provider
+gray voice status                           # three lines: speech-to-text, speaker, microphone
+gray voice test                             # record 3 s and transcribe it back
+```
+
+`gray voice status --verbose` adds the talk key, ambient listening, the
+whisper model and which provider keys are saved. Inside a session,
+`/voice setup` and `/voice status` print the same lines, and bare `/voice`
+opens the page.
 
 ## The `/voice` page
 
@@ -50,9 +64,11 @@ sentence by sentence.
 
 ## Cloud providers
 
-Listen: `whisper.cpp` locally, or Deepgram / Groq. Speak: `say` /
-`spd-say` / `espeak-ng` / `espeak` / `piper` locally, or Deepgram Aura /
-Fish Audio. Keys go in the page, or come from `DEEPGRAM_API_KEY`,
+Listen: `whisper.cpp` locally, or Deepgram / Groq. Speak: `say`, Windows
+`System.Speech`, `spd-say` / `espeak-ng` / `espeak` / `piper` locally, or
+Deepgram Aura / Fish Audio. Windows needs no install for either direction:
+speech goes through PowerShell, and the mic is recorded with `ffmpeg`
+(`winget install Gyan.FFmpeg`) when it is on `PATH`. Keys go in the page, or come from `DEEPGRAM_API_KEY`,
 `GROQ_API_KEY`, `FISH_API_KEY`; they are stored in
 `~/.gray/voice/config.json`. Keys from an older `gray-voice` / `voicepro`
 install are migrated on first run.
@@ -61,8 +77,8 @@ install are migrated on first run.
 
 | Capability | Needs |
 |---|---|
-| TTS | any of `say` / `spd-say` / `espeak-ng` / `espeak` / `piper` |
-| STT | `whisper-cli` + `arecord` or `sox` + a whisper model |
+| TTS | any of `say` / Windows `System.Speech` / `spd-say` / `espeak-ng` / `espeak` / `piper` |
+| STT | `whisper-cli` + a mic recorder (`pw-record`, `arecord`, `sox`; `ffmpeg` dshow on Windows) + a whisper model |
 | Cloud STT | a Deepgram or Groq key |
 | Cloud TTS | a Deepgram or Fish Audio key |
 
