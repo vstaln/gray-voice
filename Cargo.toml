@@ -1,6 +1,6 @@
 [package]
 name = "gray-voice"
-version = "0.1.5"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Local TTS/STT voice tools for the gray agent harness"
@@ -13,3 +13,4 @@ name = "voice"
 path = "src/main.rs"
 [dependencies]
 serde_json = { version = "1", features = ["preserve_order"] }
+crossterm = "0.28"
