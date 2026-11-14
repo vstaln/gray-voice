@@ -419,18 +419,14 @@ fn loud(path: &Path) -> bool {
 }
 
 fn recorder_program() -> Option<&'static str> {
-    let program = ["pw-record", "arecord", "sox"]
-        .iter()
-        .find(|r| in_path(r))
-        .copied();
-    if program.is_some() {
-        return program;
-    }
     #[cfg(windows)]
     if in_path("ffmpeg") {
         return Some("ffmpeg");
     }
-    None
+    ["pw-record", "arecord", "sox"]
+        .iter()
+        .find(|r| in_path(r))
+        .copied()
 }
 
 #[cfg(windows)]
@@ -489,6 +485,8 @@ fn recorder_cmd() -> Option<Command> {
         "sox" => {
             let mut c = Command::new("sox");
             c.args(["-q", "-d", "-r", "16000", "-c", "1", "-b", "16"]);
+            #[cfg(windows)]
+            c.env("AUDIODRIVER", "waveaudio");
             Some(c)
         }
         #[cfg(windows)]
