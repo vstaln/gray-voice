@@ -30,12 +30,41 @@ crashes.
 | `voice_say` | Speak text through the first available of `say` (macOS), `spd-say`, `espeak-ng`, `espeak`, `piper`. |
 | `voice_listen` | Transcribe a mic recording via `whisper.cpp` (`whisper-cli`) over `arecord`/`sox` capture. |
 
+## The `/voice` page
+
+Bare `/voice` opens the page: listen backend, speak voice, talk key, and
+whether answers are read back as they land.
+
+| Command | What it does |
+|---|---|
+| `/voice` | open the page |
+| `/voice on` · `/voice off` | ambient listening |
+| `/voice say TEXT` | speak text |
+| `/voice test` | speak a line, then transcribe it back |
+
+Dictation sits on your talk key (`ctrl+space` unless `keybindings.json` says
+otherwise for `plugin.voice.dictate`) and types the transcript into the
+composer. Holding the key talks only while held. Read-answers runs on the
+turn-end action, so the answer is spoken once the turn finishes, not
+sentence by sentence.
+
+## Cloud providers
+
+Listen: `whisper.cpp` locally, or Deepgram / Groq. Speak: `say` /
+`spd-say` / `espeak-ng` / `espeak` / `piper` locally, or Deepgram Aura /
+Fish Audio. Keys go in the page, or come from `DEEPGRAM_API_KEY`,
+`GROQ_API_KEY`, `FISH_API_KEY`; they are stored in
+`~/.gray/voice/config.json`. Keys from an older `gray-voice` / `voicepro`
+install are migrated on first run.
+
 ## Requirements (per capability)
 
 | Capability | Needs |
 |---|---|
 | TTS | any of `say` / `spd-say` / `espeak-ng` / `espeak` / `piper` |
 | STT | `whisper-cli` + `arecord` or `sox` + a whisper model |
+| Cloud STT | a Deepgram or Groq key |
+| Cloud TTS | a Deepgram or Fish Audio key |
 
 ## Build from source
 
