@@ -281,10 +281,16 @@ fn record_live(out: &std::path::Path, hold: bool, key: &str) -> Result<String, S
             break;
         }
     }
-    let interrupted = Command::new("kill")
-        .args(["-INT", &rec.id().to_string()])
-        .status()
-        .is_ok_and(|s| s.success());
+    // SIGINT lets the recorder finalize its file. Windows has no signals, and
+    // the `kill` on PATH there (Git's MSYS kill.exe) only knows MSYS pids, so
+    // terminate the recorder directly; segments are read by raw offset, so an
+    // unfinalized WAV header doesn't matter.
+    let interrupted = !cfg!(windows)
+        && Command::new("kill")
+            .args(["-INT", &rec.id().to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
     if !interrupted {
         let _ = rec.kill();
     }
@@ -1087,7 +1093,15 @@ fn tool(name: &str, args: &Value) -> Value {
 fn gray_home() -> std::path::PathBuf {
     std::env::var_os("GRAY_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".gray")))
+        .or_else(|| {
+            // Native Windows has no HOME (only Git Bash/MSYS sets it), so a
+            // gray started from cmd/PowerShell/Windows Terminal would read
+            // config and API keys from ./voice instead of ~/.gray/voice.
+            std::env::var_os("HOME")
+                .filter(|h| !h.is_empty())
+                .or_else(|| std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()))
+                .map(|h| std::path::PathBuf::from(h).join(".gray"))
+        })
         .unwrap_or_else(|| std::path::PathBuf::from("."))
 }
 fn config_path() -> std::path::PathBuf {
