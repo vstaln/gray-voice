@@ -337,6 +337,10 @@ fn level_of(mean: f64) -> usize {
     (((mean.max(1.0).ln() - 5.0) / 3.5 * 7.0).clamp(0.0, 7.0)) as usize
 }
 
+pub(crate) fn samples(b: &[u8]) -> impl Iterator<Item = i16> + '_ {
+    (0..b.len() / 2).map(move |i| i16::from_le_bytes([b[i * 2], b[i * 2 + 1]]))
+}
+
 fn tail_mean(path: &Path) -> (u64, f64) {
     use std::io::{Read, Seek, SeekFrom};
     let Ok(mut f) = std::fs::File::open(path) else {
@@ -350,11 +354,7 @@ fn tail_mean(path: &Path) -> (u64, f64) {
     if f.seek(SeekFrom::Start((len - 3200) & !1)).is_err() || f.read_exact(&mut buf).is_err() {
         return (len, 0.0);
     }
-    let mean = buf
-        .chunks_exact(2)
-        .map(|b| f64::from(i16::from_le_bytes([b[0], b[1]])).abs())
-        .sum::<f64>()
-        / 1600.0;
+    let mean = samples(&buf).map(|s| f64::from(s).abs()).sum::<f64>() / 1600.0;
     (len, mean)
 }
 
@@ -368,8 +368,8 @@ fn loud(path: &Path) -> bool {
     }
     let mut sum = 0u64;
     let mut n = 0u64;
-    for c in bytes[44..].chunks_exact(2) {
-        sum += i16::from_le_bytes([c[0], c[1]]).unsigned_abs() as u64;
+    for s in samples(&bytes[44..]) {
+        sum += s.unsigned_abs() as u64;
         n += 1;
     }
     n > 0 && (sum as f64 / n as f64) > gate

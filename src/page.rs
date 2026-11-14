@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use crate::{speech, TestEvent, MODEL_MISSING};
 
 type Rgb = (u8, u8, u8);
+type Line = (Vec<(String, Rgb)>, Vec<(String, Rgb)>, bool);
 
 struct Theme {
     surface: Rgb,
@@ -396,7 +397,7 @@ impl Page {
         let all = rows();
         let sel = all[self.sel];
         let test = self.test.lock().expect("test lock").clone();
-        let mut out: Vec<(Vec<(String, Rgb)>, Vec<(String, Rgb)>, bool)> = Vec::new();
+        let mut out: Vec<Line> = Vec::new();
         let head = |s: &str| (vec![(format!("  {s}"), t.muted)], vec![], false);
         let blank = || (vec![], vec![], false);
         let active_stt = self.active("stt");

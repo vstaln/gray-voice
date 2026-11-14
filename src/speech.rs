@@ -86,10 +86,7 @@ fn wav_levels(wav: &[u8]) -> Vec<usize> {
     wav[start..start + len]
         .chunks(window)
         .map(|c| {
-            let sum: f64 = c
-                .chunks_exact(2)
-                .map(|b| f64::from(i16::from_le_bytes([b[0], b[1]])).abs())
-                .sum();
+            let sum: f64 = crate::samples(c).map(|s| f64::from(s).abs()).sum();
             crate::level_of(sum / (c.len() / 2).max(1) as f64)
         })
         .collect()
