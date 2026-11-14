@@ -78,7 +78,7 @@ install are migrated on first run.
 | Capability | Needs |
 |---|---|
 | TTS | any of `say` / Windows `System.Speech` / `spd-say` / `espeak-ng` / `espeak` / `piper` |
-| STT | `whisper-cli` + a mic recorder (`pw-record`, `arecord`, `sox`; `ffmpeg` dshow on Windows) + a whisper model |
+| STT | `whisper-cli` + a mic recorder (`pw-record`, `arecord`, `sox`; `ffmpeg` dshow on Windows, preferred there, `sox` gets `AUDIODRIVER=waveaudio`) + a whisper model |
 | Cloud STT | a Deepgram or Groq key |
 | Cloud TTS | a Deepgram or Fish Audio key |
 
