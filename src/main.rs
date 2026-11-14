@@ -83,19 +83,27 @@ fn have(bin: &str) -> bool {
         || in_path(bin)
 }
 
+/// Extensions a command-line binary can carry. `PATHEXT` on Windows also lists
+/// shell handlers that are not programs (`.CPL`, `.MSC`, `.VBS`, `.JS`, …), so
+/// appending it verbatim matched `C:\WINDOWS\system32\main.cpl` as
+/// whisper.cpp's legacy `main` binary and made whisper look installed when it
+/// was not — which sent the user after a model instead of whisper itself.
+const RUNNABLE_EXT: [&str; 4] = [".exe", ".com", ".bat", ".cmd"];
+
 fn in_path(bin: &str) -> bool {
     let Some(paths) = std::env::var_os("PATH") else {
         return false;
     };
-    let dirs: Vec<_> = std::env::split_paths(&paths).collect();
+    in_dirs(bin, &std::env::split_paths(&paths).collect::<Vec<_>>())
+}
+
+fn in_dirs(bin: &str, dirs: &[PathBuf]) -> bool {
     if dirs.iter().any(|d| d.join(bin).is_file()) {
         return true;
     }
     if cfg!(windows) {
-        let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
-        return pathext
-            .split(';')
-            .filter(|e| !e.is_empty())
+        return RUNNABLE_EXT
+            .iter()
             .any(|ext| dirs.iter().any(|d| d.join(format!("{bin}{ext}")).is_file()));
     }
     false
@@ -1231,5 +1239,39 @@ fn main() {
             }
             fail("voice page|on|off|say TEXT|test");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::in_dirs;
+    use std::path::PathBuf;
+
+    fn dir_with(tag: &str, files: &[&str]) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("voice-bin-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("temp dir");
+        for f in files {
+            std::fs::write(d.join(f), b"").expect("write");
+        }
+        d
+    }
+
+    #[test]
+    fn a_control_panel_applet_is_not_whisper() {
+        // PATHEXT carries `.CPL` (and `.MSC`, `.VBS`, …), so appending every
+        // extension it lists made `main` resolve to C:\WINDOWS\system32\main.cpl
+        // and the plugin believe whisper.cpp was installed.
+        let system32 = dir_with("sys", &["main.cpl", "main.CPL", "whisper-cli.CPL"]);
+        assert!(!in_dirs("main", std::slice::from_ref(&system32)));
+        assert!(!in_dirs("whisper-cli", &[system32]));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_real_executable_on_the_path_is_found() {
+        let bin = dir_with("bin", &["whisper-cli.exe", "whisper-cpp.bat"]);
+        assert!(in_dirs("whisper-cli", std::slice::from_ref(&bin)));
+        assert!(in_dirs("whisper-cpp", &[bin]));
     }
 }
