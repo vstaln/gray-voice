@@ -5,7 +5,7 @@
 
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -152,43 +152,44 @@ fn read_config() -> Value {
         .unwrap_or_else(|| json!({}))
 }
 
-fn write_private(path: &Path, data: &str) -> std::io::Result<()> {
-    let mut o = std::fs::OpenOptions::new();
-    o.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        o.mode(0o600);
-    }
-    let mut f = o.open(path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    }
-    f.write_all(data.as_bytes())
-}
-
 fn update_config(f: impl FnOnce(&mut Value)) -> Result<(), String> {
     let cfg = config_path();
     if let Some(p) = cfg.parent() {
         std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
     }
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&cfg)
-        .map_err(|e| e.to_string())?;
-    lock.lock().map_err(|e| e.to_string())?;
-    let mut c = read_config();
-    if !c.is_object() {
-        c = json!({});
+    // One handle for the lock, the read and the write. The advisory lock is
+    // exclusive, and on Windows it blocks reads through any *other* handle to
+    // the same file: opening the path again to read (read_config) returned
+    // nothing and opening it again to truncate left the file empty, so every
+    // save silently wiped the settings it meant to keep.
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
     }
-    f(&mut c);
-    let r = write_private(&cfg, &serde_json::to_string_pretty(&c).unwrap_or_default());
-    let _ = lock.unlock();
+    let mut file = o.open(&cfg).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    file.lock().map_err(|e| e.to_string())?;
+    let r = (|| -> std::io::Result<()> {
+        let mut raw = String::new();
+        file.read_to_string(&mut raw)?;
+        let mut c: Value = serde_json::from_str(&raw).unwrap_or_else(|_| json!({}));
+        if !c.is_object() {
+            c = json!({});
+        }
+        f(&mut c);
+        let data = serde_json::to_string_pretty(&c).map_err(std::io::Error::other)?;
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(data.as_bytes())
+    })();
+    let _ = file.unlock();
     r.map_err(|e| e.to_string())
 }
 
@@ -1231,5 +1232,37 @@ fn main() {
             }
             fail("voice page|on|off|say TEXT|test");
         }
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::update_config;
+    use serde_json::json;
+
+    #[test]
+    fn saving_the_config_keeps_the_file_and_the_keys_it_had() {
+        // Point gray_home() at a scratch directory so the real one is untouched.
+        let home = std::env::temp_dir().join(format!("voice-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let dir = home.join("voice");
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("config.json");
+        std::env::set_var("GRAY_HOME", &home);
+
+        let before = json!({"whisper_model": "ggml-tiny.en.bin", "keys": {"groq": "k"}});
+        std::fs::write(&path, before.to_string()).expect("seed");
+
+        update_config(|c| c["migrated"] = json!(true)).expect("save");
+
+        let text = std::fs::read_to_string(&path).expect("read back");
+        let after: serde_json::Value = serde_json::from_str(&text).expect("parse");
+        // A save must not empty the file: opening it a second time to truncate
+        // fails on Windows once the first handle holds the lock, which wiped
+        // every setting on the next run.
+        assert!(text.len() > 2, "config was truncated to {text:?}");
+        assert_eq!(after["whisper_model"], "ggml-tiny.en.bin");
+        assert_eq!(after["keys"]["groq"], "k");
+        assert_eq!(after["migrated"], true);
     }
 }
