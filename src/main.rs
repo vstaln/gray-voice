@@ -846,12 +846,39 @@ fn whisper_transcribe(wav: &Path) -> Result<String, String> {
     Ok(t)
 }
 
+fn split_status(stdout: &[u8]) -> (String, String) {
+    let s = String::from_utf8_lossy(stdout);
+    let mut parts = s.trim_end().rsplitn(2, '\n');
+    let code = parts.next().unwrap_or("").trim().to_string();
+    let body = parts.next().unwrap_or("").trim_end().to_string();
+    (code, body)
+}
+
+fn reply_error(name: &str, code: &str, body: &str) -> String {
+    let detail = serde_json::from_str::<Value>(body.trim_start())
+        .ok()
+        .and_then(|v| {
+            ["/error/message", "/message", "/detail", "/error"]
+                .iter()
+                .find_map(|p| v.pointer(p).and_then(Value::as_str))
+                .map(str::to_string)
+        })
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or_else(|| body.trim().chars().take(80).collect::<String>());
+    if detail.is_empty() {
+        return format!("{name} {code}");
+    }
+    format!("{name} {code} {detail}")
+}
+
 fn transcribe_groq(key: &str, wav: &Path) -> Result<String, String> {
     let mut child = Command::new("curl")
         .args([
             "-sS",
             "--max-time",
             "90",
+            "-w",
+            "\n%{http_code}",
             "-K",
             "-",
             "-X",
@@ -873,18 +900,18 @@ fn transcribe_groq(key: &str, wav: &Path) -> Result<String, String> {
         let _ = writeln!(si, "header = \"Authorization: Bearer {key}\"");
     }
     let out = child.wait_with_output().map_err(|e| format!("curl: {e}"))?;
-    let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let (code, body) = split_status(&out.stdout);
     if !out.status.success() {
         return Err("Groq offline".into());
+    }
+    if !code.starts_with('2') {
+        return Err(reply_error("Groq", &code, &body));
     }
     if body.starts_with('{') {
         let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
         return match v["text"].as_str() {
             Some(t) => Ok(t.to_string()),
-            None => Err(match v["error"]["code"].as_str() {
-                Some("invalid_api_key") => "Groq invalid key".to_string(),
-                _ => format!("Groq {}", body.chars().take(80).collect::<String>()),
-            }),
+            None => Err(reply_error("Groq", &code, &body)),
         };
     }
     Ok(body)
@@ -903,6 +930,8 @@ fn transcribe_custom(e: &Value, wav: &Path) -> Result<String, String> {
             "-sS",
             "--max-time",
             "90",
+            "-w",
+            "\n%{http_code}",
             "-K",
             "-",
             "-X",
@@ -928,23 +957,19 @@ fn transcribe_custom(e: &Value, wav: &Path) -> Result<String, String> {
     let out = child
         .wait_with_output()
         .map_err(|err| format!("curl: {err}"))?;
-    let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let (code, body) = split_status(&out.stdout);
     if !out.status.success() {
         return Err(format!("{name} offline"));
+    }
+    if !code.starts_with('2') {
+        return Err(reply_error(&name, &code, &body));
     }
     if body.starts_with('{') {
         let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
         if let Some(t) = v["text"].as_str() {
             return Ok(t.to_string());
         }
-        let msg = ["/error/message", "/message", "/detail", "/error"]
-            .iter()
-            .find_map(|p| v.pointer(p).and_then(Value::as_str))
-            .unwrap_or(&body);
-        return Err(format!(
-            "{name} {}",
-            msg.chars().take(80).collect::<String>()
-        ));
+        return Err(reply_error(&name, &code, &body));
     }
     if body.is_empty() {
         return Err(format!("{name} empty reply"));
