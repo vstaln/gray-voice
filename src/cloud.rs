@@ -151,7 +151,41 @@ pub fn deepgram_transcribe(key: &str, wav: &Path) -> Result<String, String> {
         .to_string())
 }
 
+fn synth_custom(e: &serde_json::Value, text: &str) -> Result<Vec<u8>, String> {
+    let name = crate::custom_name(e, "Endpoint");
+    let base = e["base_url"].as_str().unwrap_or("").trim_end_matches('/');
+    if base.is_empty() {
+        return Err(format!("{name} no base url"));
+    }
+    let mut headers = Vec::new();
+    if let Some(key) = e["key"].as_str().filter(|k| !k.is_empty()) {
+        headers.push(format!("Authorization: Bearer {key}"));
+    }
+    let body = json!({
+        "model": e["model"],
+        "input": text,
+        "voice": e["voice"],
+        "response_format": "mp3",
+    });
+    let r = post(
+        &format!("{base}/audio/speech"),
+        &headers,
+        "application/json",
+        body.to_string().as_bytes(),
+    )?;
+    if !(200..300).contains(&r.code) {
+        return Err(format!("{name} {}", detail(&r)));
+    }
+    if r.body.is_empty() {
+        return Err(format!("{name} returned no audio"));
+    }
+    Ok(r.body)
+}
+
 pub fn synth(provider: &str, text: &str) -> Result<Vec<u8>, String> {
+    if let Some(e) = crate::custom_tts(provider) {
+        return synth_custom(&e, text);
+    }
     let (name, url, headers, body) = match provider {
         "deepgram" => {
             let key = crate::provider_key("deepgram").ok_or("No Deepgram key")?;

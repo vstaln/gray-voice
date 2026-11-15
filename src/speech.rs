@@ -253,8 +253,18 @@ pub fn say(text: &str, engine: Option<&str>, rate: Option<u64>) -> Result<String
     let rate = rate.unwrap_or(180).to_string();
     let (provider, engine) = match engine {
         Some(e @ ("deepgram" | "fish")) => (e.to_string(), None),
+        Some(e) if crate::custom_tts(e).is_some() => (e.to_string(), None),
         Some(e) => ("local".to_string(), Some(e.to_string())),
-        None => (tts_active(), None),
+        None => {
+            let a = tts_active();
+            if matches!(a.as_str(), "local" | "deepgram" | "fish")
+                || crate::custom_tts(&a).is_some()
+            {
+                (a, None)
+            } else {
+                ("local".to_string(), None)
+            }
+        }
     };
     let flag = Flag;
     flag.touch();

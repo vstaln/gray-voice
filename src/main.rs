@@ -293,6 +293,54 @@ fn provider_key(id: &str) -> Option<String> {
         .filter(|k| !k.is_empty())
 }
 
+pub(crate) fn custom_list(kind: &str) -> Vec<Value> {
+    read_config()["custom"][kind]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+pub(crate) fn custom_entry(kind: &str, id: &str) -> Option<Value> {
+    custom_list(kind)
+        .into_iter()
+        .find(|e| e["id"].as_str() == Some(id))
+}
+
+pub(crate) fn custom_stt(id: &str) -> Option<Value> {
+    custom_entry("stt", id)
+}
+
+pub(crate) fn custom_tts(id: &str) -> Option<Value> {
+    custom_entry("tts", id)
+}
+
+fn custom_name(e: &Value, fallback: &str) -> String {
+    e["name"]
+        .as_str()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+pub(crate) fn custom_id(taken: &[Value]) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(1);
+    let mut seed =
+        nanos ^ (u64::from(std::process::id()) << 40) ^ CONFIG_SEQ.load(Ordering::Relaxed);
+    loop {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let id = format!("c-{:06x}", seed & 0xff_ffff);
+        if !taken.iter().any(|e| e["id"].as_str() == Some(id.as_str())) {
+            return id;
+        }
+    }
+}
+
 fn stt_active() -> String {
     read_config()["stt"].as_str().unwrap_or("local").to_string()
 }
@@ -735,6 +783,7 @@ fn stt_problem() -> Option<String> {
             Some(format!("No {name} key \u{b7} add one in /voice"))
         }
         "deepgram" | "groq" => None,
+        other if custom_stt(other).is_some() => None,
         _ => local_stt_problem(),
     }
 }
@@ -841,6 +890,68 @@ fn transcribe_groq(key: &str, wav: &Path) -> Result<String, String> {
     Ok(body)
 }
 
+fn transcribe_custom(e: &Value, wav: &Path) -> Result<String, String> {
+    let name = custom_name(e, "Endpoint");
+    let base = e["base_url"].as_str().unwrap_or("").trim_end_matches('/');
+    if base.is_empty() {
+        return Err(format!("{name} no base url"));
+    }
+    let url = format!("{base}/audio/transcriptions");
+    let model = e["model"].as_str().unwrap_or("");
+    let mut child = Command::new("curl")
+        .args([
+            "-sS",
+            "--max-time",
+            "90",
+            "-K",
+            "-",
+            "-X",
+            "POST",
+            &url,
+            "-F",
+            &format!("file=@{}", wav.display()),
+            "-F",
+            &format!("model={model}"),
+            "-F",
+            "response_format=text",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("curl: {err}"))?;
+    if let Some(key) = e["key"].as_str().filter(|k| !k.is_empty()) {
+        if let Some(mut si) = child.stdin.take() {
+            let _ = writeln!(si, "header = \"Authorization: Bearer {key}\"");
+        }
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|err| format!("curl: {err}"))?;
+    let body = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() {
+        return Err(format!("{name} offline"));
+    }
+    if body.starts_with('{') {
+        let v: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        if let Some(t) = v["text"].as_str() {
+            return Ok(t.to_string());
+        }
+        let msg = ["/error/message", "/message", "/detail", "/error"]
+            .iter()
+            .find_map(|p| v.pointer(p).and_then(Value::as_str))
+            .unwrap_or(&body);
+        return Err(format!(
+            "{name} {}",
+            msg.chars().take(80).collect::<String>()
+        ));
+    }
+    if body.is_empty() {
+        return Err(format!("{name} empty reply"));
+    }
+    Ok(body)
+}
+
 fn is_silence_hallucination(t: &str) -> bool {
     let norm: String = t
         .chars()
@@ -869,7 +980,10 @@ fn stt_transcribe(wav: &Path) -> Result<String, String> {
             cloud::deepgram_transcribe(&provider_key("deepgram").ok_or("No Deepgram key")?, wav)
         }
         "groq" => transcribe_groq(&provider_key("groq").ok_or("No Groq key")?, wav),
-        _ => whisper_transcribe(wav),
+        other => match custom_stt(other) {
+            Some(e) => transcribe_custom(&e, wav),
+            None => whisper_transcribe(wav),
+        },
     }?;
     if is_silence_hallucination(&t) {
         return Err(NOISE.into());
@@ -1181,11 +1295,23 @@ fn key_label(key: &str) -> String {
         .join("+")
 }
 
+fn stt_label_id() -> String {
+    let id = stt_active();
+    if custom_stt(&id).is_some() {
+        return id;
+    }
+    match id.as_str() {
+        "local" | "deepgram" | "groq" => id,
+        _ => "local".to_string(),
+    }
+}
+
 fn provider_label(id: &str) -> String {
-    STT_NAMES
-        .iter()
-        .find(|(n, _)| *n == id)
-        .map(|(_, l)| (*l).to_string())
+    if let Some((_, l)) = STT_NAMES.iter().find(|(n, _)| *n == id) {
+        return (*l).to_string();
+    }
+    custom_stt(id)
+        .and_then(|e| e["name"].as_str().map(str::to_string))
         .unwrap_or_else(|| id.to_string())
 }
 
@@ -1221,25 +1347,37 @@ fn whisper_state() -> String {
 }
 
 fn speaker_line() -> String {
-    match speech::tts_active().as_str() {
-        "deepgram" => "Deepgram Aura".into(),
-        "fish" => "Fish Audio".into(),
-        _ => match speech::local_engine() {
-            Some(e) if e == "windows" => "Windows voice (System.Speech)".into(),
-            Some(e) => e,
-            None => no_speaker_line(),
-        },
+    let id = speech::tts_active();
+    match id.as_str() {
+        "deepgram" => return "Deepgram Aura".into(),
+        "fish" => return "Fish Audio".into(),
+        "local" => {}
+        other => {
+            if let Some(name) = custom_tts(other).as_ref().map(|e| custom_name(e, other)) {
+                return name;
+            }
+        }
+    }
+    match speech::local_engine() {
+        Some(e) if e == "windows" => "Windows voice (System.Speech)".into(),
+        Some(e) => e,
+        None => no_speaker_line(),
     }
 }
 
 fn status_text(verbose: bool) -> String {
-    let id = stt_active();
+    let id = stt_label_id();
     let stt = match stt_problem() {
-        None => format!(
-            "{} ({})",
-            provider_label(&id),
-            if id == "local" { "ready" } else { "key saved" }
-        ),
+        None => {
+            let label = provider_label(&id);
+            if id == "local" {
+                format!("{label} (ready)")
+            } else if custom_stt(&id).is_some() {
+                label
+            } else {
+                format!("{label} (key saved)")
+            }
+        }
         Some(p) => format!("{} \u{b7} {p}", provider_label(&id)),
     };
     let mic = recorder_label().unwrap_or_else(no_recorder_line);
