@@ -68,12 +68,68 @@ fn theme() -> Theme {
 #[derive(Clone, Copy, PartialEq)]
 enum Row {
     Stt(usize),
+    SttCustom(usize),
+    SttAdd,
     Read,
     Tts(usize),
+    TtsCustom(usize),
+    TtsAdd,
     Key,
     Hold,
     Ambient,
     Test,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Stt,
+    Tts,
+}
+
+impl Kind {
+    fn key(self) -> &'static str {
+        match self {
+            Kind::Stt => "stt",
+            Kind::Tts => "tts",
+        }
+    }
+}
+
+struct Form {
+    kind: Kind,
+    step: usize,
+    text: String,
+    name: String,
+    base_url: String,
+    model: String,
+    voice: String,
+}
+
+impl Form {
+    fn steps(&self) -> &'static [&'static str] {
+        match self.kind {
+            Kind::Stt => &["Name", "Base URL", "Model", "API key"],
+            Kind::Tts => &["Name", "Base URL", "Model", "Voice", "API key"],
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        self.steps()[self.step.min(self.steps().len() - 1)]
+    }
+
+    fn placeholder(&self) -> &'static str {
+        match (self.kind, self.label()) {
+            (_, "Base URL") => "https://api.openai.com/v1",
+            (Kind::Stt, "Model") => "whisper-1",
+            (Kind::Tts, "Model") => "tts-1",
+            (Kind::Tts, "Voice") => "alloy",
+            _ => "",
+        }
+    }
+
+    fn masked(&self) -> bool {
+        self.label() == "API key"
+    }
 }
 
 const STT: [(&str, &str); 3] = [
@@ -86,14 +142,6 @@ const TTS: [(&str, &str); 3] = [
     ("deepgram", "Deepgram Aura"),
     ("fish", "Fish Audio"),
 ];
-
-fn rows() -> Vec<Row> {
-    let mut r: Vec<Row> = (0..3).map(Row::Stt).collect();
-    r.push(Row::Read);
-    r.extend((0..3).map(Row::Tts));
-    r.extend([Row::Key, Row::Hold, Row::Ambient, Row::Test]);
-    r
-}
 
 fn key_id(row: Row) -> Option<&'static str> {
     match row {
@@ -131,6 +179,8 @@ struct Page {
     sel: usize,
     cfg: Value,
     field: Option<Field>,
+    form: Option<Form>,
+    del: Option<Row>,
     capturing: bool,
     note: Option<String>,
     test: Arc<Mutex<TestState>>,
@@ -146,6 +196,8 @@ impl Page {
             sel: 0,
             cfg: Value::Null,
             field: None,
+            form: None,
+            del: None,
             capturing: false,
             note: None,
             test: Arc::new(Mutex::new(TestState::Idle)),
@@ -184,10 +236,45 @@ impl Page {
         crate::provider_key(id).is_some()
     }
 
+    fn custom(&self, kind: &str) -> Vec<Value> {
+        self.cfg["custom"][kind]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn custom_at(&self, row: Row) -> Option<(&'static str, Value)> {
+        match row {
+            Row::SttCustom(i) => self.custom("stt").into_iter().nth(i).map(|e| ("stt", e)),
+            Row::TtsCustom(i) => self.custom("tts").into_iter().nth(i).map(|e| ("tts", e)),
+            _ => None,
+        }
+    }
+
+    fn rows(&self) -> Vec<Row> {
+        let (stt, tts) = (self.custom("stt").len(), self.custom("tts").len());
+        let mut r: Vec<Row> = (0..3).map(Row::Stt).collect();
+        r.extend((0..stt).map(Row::SttCustom));
+        r.push(Row::SttAdd);
+        r.push(Row::Read);
+        r.extend((0..3).map(Row::Tts));
+        r.extend((0..tts).map(Row::TtsCustom));
+        r.push(Row::TtsAdd);
+        r.extend([Row::Key, Row::Hold, Row::Ambient, Row::Test]);
+        r
+    }
+
     fn activate(&mut self, row: Row) {
         match row {
             Row::Stt(i) => self.set(|c| c["stt"] = json!(STT[i].0)),
             Row::Tts(i) => self.set(|c| c["tts"] = json!(TTS[i].0)),
+            Row::SttCustom(_) | Row::TtsCustom(_) => {
+                if let Some((kind, e)) = self.custom_at(row) {
+                    if let Some(id) = e["id"].as_str().map(str::to_string) {
+                        self.set(|c| c[kind] = json!(id));
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -204,10 +291,128 @@ impl Page {
         });
     }
 
+    fn open_form(&mut self, kind: Kind) {
+        self.note = None;
+        self.form = Some(Form {
+            kind,
+            step: 0,
+            text: String::new(),
+            name: String::new(),
+            base_url: String::new(),
+            model: String::new(),
+            voice: String::new(),
+        });
+    }
+
+    fn save_form(&mut self, f: Form, key: String) {
+        let kind = f.kind.key();
+        let id = crate::custom_id(&self.custom(kind));
+        let active = id.clone();
+        let mut entry = json!({
+            "id": id,
+            "name": f.name,
+            "base_url": f.base_url,
+            "model": f.model,
+        });
+        if f.kind == Kind::Tts {
+            entry["voice"] = json!(f.voice);
+        }
+        if !key.is_empty() {
+            entry["key"] = json!(key);
+        }
+        self.set(|c| {
+            if !c["custom"].is_object() {
+                c["custom"] = json!({"stt": [], "tts": []});
+            }
+            if !c["custom"][kind].is_array() {
+                c["custom"][kind] = json!([]);
+            }
+            if let Some(a) = c["custom"][kind].as_array_mut() {
+                a.push(entry.clone());
+            }
+            c[kind] = json!(active);
+        });
+        if self.note.is_none() {
+            self.note = Some("Endpoint saved".into());
+        }
+    }
+
+    fn form_key(&mut self, k: KeyEvent) {
+        let Some(mut f) = self.form.take() else {
+            return;
+        };
+        match k.code {
+            KeyCode::Esc => {}
+            KeyCode::Enter => {
+                if f.step == 0 && f.text.trim().is_empty() {
+                    self.form = Some(f);
+                    return;
+                }
+                let value = if f.text.trim().is_empty() {
+                    f.placeholder().to_string()
+                } else {
+                    f.text.trim().to_string()
+                };
+                f.text.clear();
+                if f.step + 1 == f.steps().len() {
+                    self.save_form(f, value);
+                } else {
+                    match f.step {
+                        0 => f.name = value,
+                        1 => f.base_url = value,
+                        2 => f.model = value,
+                        _ => f.voice = value,
+                    }
+                    f.step += 1;
+                    self.form = Some(f);
+                }
+            }
+            KeyCode::Backspace => {
+                f.text.pop();
+                self.form = Some(f);
+            }
+            KeyCode::Char('u') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                f.text.clear();
+                self.form = Some(f);
+            }
+            KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                f.text.push(c);
+                self.form = Some(f);
+            }
+            _ => self.form = Some(f),
+        }
+    }
+
+    fn delete_custom(&mut self, row: Row) {
+        self.note = None;
+        let Some((kind, e)) = self.custom_at(row) else {
+            return;
+        };
+        let Some(id) = e["id"].as_str().map(str::to_string) else {
+            return;
+        };
+        let active = self.active(kind) == id;
+        let gone = id.clone();
+        self.set(|c| {
+            if let Some(a) = c["custom"][kind].as_array_mut() {
+                a.retain(|x| x["id"].as_str() != Some(gone.as_str()));
+            }
+            if active {
+                c[kind] = json!("local");
+            }
+        });
+        if self.note.is_none() {
+            self.note = Some("Endpoint deleted".into());
+        }
+    }
+
     fn press(&mut self, row: Row) {
         self.note = None;
         match row {
             Row::Stt(0) | Row::Tts(0) => self.activate(row),
+            Row::SttCustom(_) | Row::TtsCustom(_) => self.activate(row),
+            Row::SttAdd => self.open_form(Kind::Stt),
+            Row::TtsAdd => self.open_form(Kind::Tts),
             Row::Stt(_) | Row::Tts(_) => match key_id(row) {
                 Some(id) if self.has_key(id) => self.activate(row),
                 _ => self.open_field(row),
@@ -393,8 +598,7 @@ impl Page {
     }
 
     fn render(&self, t: &Theme, width: usize) -> Vec<String> {
-        let inner = width - 2;
-        let all = rows();
+        let all = self.rows();
         let sel = all[self.sel];
         let test = self.test.lock().expect("test lock").clone();
         let mut out: Vec<Line> = Vec::new();
@@ -450,6 +654,29 @@ impl Page {
                         };
                         (t.body, Some(active_tts == id), label, right)
                     }
+                    Row::SttCustom(i) => {
+                        let list = self.custom("stt");
+                        let e = list.get(i).cloned().unwrap_or(Value::Null);
+                        let id = e["id"].as_str().unwrap_or("");
+                        (
+                            t.body,
+                            Some(active_stt == id),
+                            entry_name(&e),
+                            endpoint_right(&e, on && self.del == Some(r), t),
+                        )
+                    }
+                    Row::TtsCustom(i) => {
+                        let list = self.custom("tts");
+                        let e = list.get(i).cloned().unwrap_or(Value::Null);
+                        let id = e["id"].as_str().unwrap_or("");
+                        (
+                            t.body,
+                            Some(active_tts == id),
+                            entry_name(&e),
+                            endpoint_right(&e, on && self.del == Some(r), t),
+                        )
+                    }
+                    Row::SttAdd | Row::TtsAdd => (t.dim, None, "+ Add endpoint".into(), vec![]),
                     Row::Read => (
                         t.body,
                         None,
@@ -505,9 +732,23 @@ impl Page {
                     false,
                 ));
             }
+            if let Some(f) = self.form.as_ref().filter(|f| form_anchor(f.kind) == r) {
+                let shown = if f.masked() {
+                    "\u{2022}".repeat(f.text.chars().count().min(24))
+                } else {
+                    f.text.clone()
+                };
+                let mut left = vec![(format!("      {} ", f.label().to_lowercase()), t.dim)];
+                if shown.is_empty() {
+                    left.push((f.placeholder().to_string(), t.muted));
+                } else {
+                    left.push((format!("{shown}\u{258f}"), t.bright));
+                }
+                out.push((left, vec![], false));
+            }
             if r == Row::Test {
                 if let TestState::Done(Ok(Some(text))) = &test {
-                    let shown: String = text.chars().take(inner.saturating_sub(8)).collect();
+                    let shown: String = text.chars().take(width.saturating_sub(8)).collect();
                     out.push((
                         vec![(format!("      \u{201c}{shown}\u{201d}"), t.muted)],
                         vec![],
@@ -536,6 +777,18 @@ impl Page {
             (h.to_string(), t.dim)
         } else if self.capturing {
             ("press the new key \u{b7} esc".to_string(), t.dim)
+        } else if let Some(f) = &self.form {
+            let h = if f.masked() {
+                "enter skip \u{b7} esc cancels"
+            } else {
+                "enter next \u{b7} esc cancels"
+            };
+            (h.to_string(), t.dim)
+        } else if self.custom_at(sel).is_some() {
+            (
+                "\u{2191}\u{2193} \u{b7} enter \u{b7} d delete \u{b7} esc".to_string(),
+                t.dim,
+            )
         } else if key_id(sel).is_some() {
             (
                 "\u{2191}\u{2193} \u{b7} enter \u{b7} k key \u{b7} esc".to_string(),
@@ -549,25 +802,52 @@ impl Page {
         };
         out.push((vec![(format!("  {}", hint.0), hint.1)], vec![], false));
 
-        let title = " Voice ";
-        let top = format!(
-            "\u{256d}\u{2500}{title}{}\u{256e}",
-            "\u{2500}".repeat(inner.saturating_sub(title.len() + 1))
-        );
-        let mut lines = vec![paint(&top, t.dim, t.surface)];
+        let title = format!("  Voice{}", " ".repeat(width.saturating_sub(7)));
+        let mut lines = vec![paint(&title, t.muted, t.surface)];
+        lines.push(compose(&[], &[], width, t.surface));
         for (left, right, on) in &out {
             let bg = if *on { t.raised } else { t.surface };
-            let body = compose(left, right, inner, bg);
-            lines.push(format!(
-                "{}\u{2502}{}{}\u{2502}\x1b[0m",
-                fgbg(t.dim, t.surface),
-                body,
-                fgbg(t.dim, t.surface)
-            ));
+            lines.push(compose(left, right, width, bg));
         }
-        let bottom = format!("\u{2570}{}\u{256f}", "\u{2500}".repeat(inner));
-        lines.push(paint(&bottom, t.dim, t.surface));
         lines
+    }
+}
+
+fn form_anchor(kind: Kind) -> Row {
+    match kind {
+        Kind::Stt => Row::SttAdd,
+        Kind::Tts => Row::TtsAdd,
+    }
+}
+
+fn entry_name(e: &Value) -> String {
+    e["name"]
+        .as_str()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .unwrap_or("endpoint")
+        .to_string()
+}
+
+fn host_of(url: &str) -> String {
+    let rest = url.split("://").nth(1).unwrap_or(url);
+    rest.split('/')
+        .next()
+        .unwrap_or(rest)
+        .chars()
+        .take(28)
+        .collect()
+}
+
+fn endpoint_right(e: &Value, confirming: bool, t: &Theme) -> Vec<(String, Rgb)> {
+    if confirming {
+        return vec![("d again to delete".to_string(), t.accent)];
+    }
+    let host = host_of(e["base_url"].as_str().unwrap_or(""));
+    if host.is_empty() {
+        Vec::new()
+    } else {
+        vec![(host, t.dim)]
     }
 }
 
@@ -671,7 +951,7 @@ fn event_loop(out: &mut std::io::Stdout, hosted: bool) -> Result<(), String> {
     let t = theme();
     let mut page = Page::new();
     let mut last = String::new();
-    let count = rows().len();
+    let (mut prev_y, mut prev_x, mut prev_len) = (0usize, 0usize, 0usize);
     loop {
         page.poll_check();
         if let Some(Field {
@@ -692,9 +972,18 @@ fn event_loop(out: &mut std::io::Stdout, hosted: bool) -> Result<(), String> {
         if !hosted && last.is_empty() {
             frame.push_str("\x1b[2J");
         }
+        if prev_len > 0 && (prev_len != lines.len() || prev_y != y || prev_x != x) {
+            let blank = paint(&" ".repeat(width), t.surface, t.surface);
+            for i in 0..prev_len {
+                frame.push_str(&format!("\x1b[{};{}H{blank}", prev_y + i, prev_x));
+            }
+        }
         for (i, l) in lines.iter().enumerate() {
             frame.push_str(&format!("\x1b[{};{}H{l}", y + i, x));
         }
+        prev_y = y;
+        prev_x = x;
+        prev_len = lines.len();
         if frame != last {
             let _ = out.write_all(frame.as_bytes());
             let _ = out.flush();
@@ -720,13 +1009,33 @@ fn event_loop(out: &mut std::io::Stdout, hosted: bool) -> Result<(), String> {
             page.field_key(k);
             continue;
         }
-        let row = rows()[page.sel];
+        if page.form.is_some() {
+            page.form_key(k);
+            continue;
+        }
+        let all = page.rows();
+        let count = all.len();
+        if page.sel >= count {
+            page.sel = count.saturating_sub(1);
+        }
+        let row = all[page.sel];
+        if k.code != KeyCode::Char('d') {
+            page.del = None;
+        }
         match k.code {
             KeyCode::Esc | KeyCode::Char('q') => return Ok(()),
             KeyCode::Up => page.sel = (page.sel + count - 1) % count,
             KeyCode::Down | KeyCode::Tab => page.sel = (page.sel + 1) % count,
             KeyCode::Enter | KeyCode::Char(' ') => page.press(row),
             KeyCode::Char('k') => page.open_field(row),
+            KeyCode::Char('d') if page.custom_at(row).is_some() => {
+                if page.del == Some(row) {
+                    page.del = None;
+                    page.delete_custom(row);
+                } else {
+                    page.del = Some(row);
+                }
+            }
             _ => {}
         }
     }
